@@ -1,0 +1,17 @@
+[package]
+name = "insur-rag"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow-array = "57.1.0"
+dotenvy = "0.15.7"
+fastembed = "5.6.0"
+lancedb = "0.23.1"
+# PyO3 用來呼叫 Python，auto-initialize 功能會自動尋找環境
+pyo3 = { version = "0.20", features = ["auto-initialize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.49.0", features = ["full"] }
+walkdir = "2.4" # 之後掃描目錄用，先加進來
+
