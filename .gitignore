@@ -1,3 +1,7 @@
 /target
 .env
+.fastembeded_cache
+.DS_Store
+/data/lancedb_store
+/data/*.pdf
 

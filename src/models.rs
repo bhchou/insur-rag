@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InsuranceMetadata {
     // 對應 JSON: "product_name"
     pub product_name: String,
@@ -13,14 +13,12 @@ pub struct InsuranceMetadata {
     // 對應 JSON: ["終身壽險", "美元保單"...] -> Rust Vec<String>
     pub insurance_type: Vec<String>,
 
-    // 對應 JSON: null -> Rust Option::None
-    pub target_audience: Option<String>,
-
     // 對應 JSON: ["身故...", "完全失能..."] -> Rust Vec<String>
     pub benefits: Vec<String>,
 
     // 對應 JSON: "USD"
     pub currency: String,
+    pub target_audience: Option<String>,
 }
 
 // 這是為了包含全文內容的 Wrapper (假設 Python 最終會吐出 JSON + 全文)
