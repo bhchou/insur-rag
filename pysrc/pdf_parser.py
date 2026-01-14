@@ -11,11 +11,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==========================================
-# 🔧 設定區 (請依據您的實際環境修改)
+# 🔧 設定區 
 # ==========================================
 #
-VLLM_ENDPOINT = os.getenv("VLLM_ENDPOINT")  # 例如: http://192.168.1.100:8000
-MODEL_NAME = os.getenv("MODEL_NAME")              # 例如: meta-llama/Llama-3-8b-instruct
+VLLM_ENDPOINT = os.getenv("VLLM_ENDPOINT")  
+MODEL_NAME = os.getenv("MODEL_NAME")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 
 def clean_json_string(text):
@@ -45,14 +45,6 @@ def extract_metadata_via_llm(text_content):
     # 只有當 Token 有效且不是 none 時才加入 Authorization
     if BEARER_TOKEN and str(BEARER_TOKEN).lower() not in ['none', '', 'null']:
         headers["Authorization"] = f"Bearer {BEARER_TOKEN}"
-
-        
-    #url = f"{VLLM_ENDPOINT}/v1/chat/completions"
-    
-    # 設置請求標頭 (參考您提供的程式碼)
-    #headers = {"Content-Type": "application/json"}
-    #if BEARER_TOKEN:
-    #    headers["Authorization"] = f"Bearer {BEARER_TOKEN}"
 
     ###
     # 定義提示詞 (System Prompt + User Context)
@@ -92,11 +84,6 @@ def extract_metadata_via_llm(text_content):
         
         if response.status_code == 200:
             result = response.json()
-            #content = resp_json["choices"][0]["message"]["content"]
-            
-            # 清理並解析 JSON
-            #cleaned_content = clean_json_string(content)
-            #print(f"[Python] LLM Response: {cleaned_content}...", file=sys.stderr) # debug log
             
             #return json.loads(cleaned_content)
             if 'choices' in result and len(result['choices']) > 0:

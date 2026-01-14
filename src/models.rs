@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
+use serde::de::Deserializer;
+use serde_json::Value;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InsuranceMetadata {
-    // 對應 JSON: "product_name"
+    // 加上 deserialize_with，處理 product_name 變成陣列的情況 
+    // 這樣即使 LLM 回傳 ["A", "B"]，這裡也會自動變成字串 "A, B"，不會報錯
+    #[serde(default, deserialize_with = "deserialize_string_or_seq")]
     pub product_name: String,
 
-    // 對應 JSON: "product_code"
-    // 因為有時候可能沒抓到或格式不同，用 Option 比較安全，
-    // 且您的值其實是備查文號，保留 String 很合適
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_seq")]
     pub product_code: Option<String>,
 
     // 對應 JSON: ["終身壽險", "美元保單"...] -> Rust Vec<String>
@@ -17,7 +19,10 @@ pub struct InsuranceMetadata {
     pub benefits: Vec<String>,
 
     // 對應 JSON: "USD"
+    #[serde(default, deserialize_with = "deserialize_string_or_seq")]
     pub currency: String,
+
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_seq")]
     pub target_audience: Option<String>,
 }
 
@@ -26,4 +31,49 @@ pub struct InsuranceMetadata {
 pub struct ParsedDocument {
     pub metadata: InsuranceMetadata,
     pub full_text: String, 
+}
+
+// --- 工具 1: 強制轉為 String (給 product_name 用) ---
+// 無論 JSON 是 "A" 還是 ["A", "B"]，最後都會變成 String "A, B"
+fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Value = Deserialize::deserialize(deserializer)?;
+    match v {
+        Value::String(s) => Ok(s),
+        Value::Array(arr) => {
+            // 把陣列裡的字串全部接起來
+            let joined = arr.iter()
+                .map(|val| val.as_str().unwrap_or("").to_string())
+                .collect::<Vec<String>>()
+                .join(", ");
+            Ok(joined)
+        },
+        Value::Null => Ok("Unknown Product".to_string()), // 預設值
+        _ => Ok(v.to_string()),
+    }
+}
+
+// --- 工具 2: 轉為 Option<String> (給 code/audience 用) ---
+// 保留原本的邏輯，處理可能為 None 的欄位
+fn deserialize_optional_string_or_seq<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Value = Deserialize::deserialize(deserializer)?;
+    match v {
+        Value::String(s) => {
+            if s.trim().is_empty() { Ok(None) } else { Ok(Some(s)) }
+        },
+        Value::Array(arr) => {
+            let joined = arr.iter()
+                .map(|val| val.as_str().unwrap_or("").to_string())
+                .collect::<Vec<String>>()
+                .join(", ");
+            Ok(Some(joined))
+        },
+        Value::Null => Ok(None),
+        _ => Ok(Some(v.to_string())),
+    }
 }
