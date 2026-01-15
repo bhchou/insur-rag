@@ -4,7 +4,10 @@ use futures::TryStreamExt;
 use dotenvy::dotenv; 
 use serde_json::{Value, json};
 use walkdir::WalkDir;
+use sha2::{Sha256, Digest};
+use hex;
 
+use std::collections::{HashMap, HashSet};
 use std::env; 
 use std::path::Path;
 use std::process::Command;
@@ -12,19 +15,36 @@ use std::sync::Arc;
 use std::error::Error;
 use std::thread;
 use std::time::{self, Duration};
+use std::fs;
+use std::io::{self, Write};
 
 use models::ParsedDocument;
 
 // LanceDB 與 Arrow 相關引入
 use lancedb::{connect, query::{ExecutableQuery, QueryBase}};
 use arrow_schema::{Schema, Field, DataType};
-use arrow_array::{RecordBatch, StringArray, builder::Float32Builder, builder::FixedSizeListBuilder, Array};
+use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, builder::Float32Builder, builder::FixedSizeListBuilder, Array};
 use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
 
 // --- 設定區 ---
 const RAW_PDF_DIR: &str = "./data/raw_pdfs"; // 請建立此資料夾並放入您的 100 個 PDF
-const DB_URI: &str = "data/lancedb_store";
+const PROCESSED_JSON_DIR: &str = "./data/processed_json";
+const DB_URI: &str = "data/lancedb_insure";
 const TABLE_NAME: &str = "insurance_docs";
+const SYNONYMS_PATH: &str = "./data/synonyms.json";
+
+#[derive(Clone)]
+struct ProductSummary {
+    name: String,
+    intro: String, // 這裡會存：商品類型 + 特色 + 適合對象
+}
+
+// 輔助函式：計算字串的 SHA256 Hash
+fn calculate_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 // --- 1. Python Bridge (與 Python 溝通) ---
 fn run_python_parser(pdf_path: &str) -> Result<ParsedDocument, Box<dyn Error>> {
@@ -170,17 +190,21 @@ fn semantic_chunking(doc: &ParsedDocument, filename: &str) -> Vec<String> {
 
 // --- 5. 生成回答 (Generation) ---
 async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
-    println!("\n🤖 正在詢問 LLM (這可能需要幾秒鐘)...");
+    println!("🤖 正在詢問 LLM (這可能需要幾秒鐘)...");
 
-    // 1. 準備 Prompt
-    let system_prompt = "你是一個專業的保險顧問。請根據以下提供的『參考資料』回答使用者的問題。如果資料中沒有答案，請直接說『資料不足，無法回答』，不要捏造事實。";
+    // 1. 準備 Prompt (🔥 已升級：加入來源引用指令)
+    // 我們告訴 LLM，如果 context 裡有檔名，盡量在回答時帶出來
+    let system_prompt = "你是一個專業的保險顧問。請根據以下提供的『參考資料』(包含商品摘要與詳細片段) 回答使用者的問題。\
+    \n\n重要規則：\
+    \n1. 若資料中包含來源檔案名稱 (Source File)，請嘗試在回答中標註。\
+    \n2. 如果資料中沒有答案，請直接說『資料不足，無法回答』，不要捏造事實。";
+
     let user_prompt = format!(
         "參考資料：\n{}\n\n使用者問題：{}", 
         context, query
     );
 
-    // 2. 準備 HTTP Client
-
+    // 2. 準備 HTTP Client (保留您的 no_proxy 設定)
     let client = reqwest::Client::builder()
         .no_proxy() // 不要管 http_proxy/HTTP_PROXY
         .build()?; 
@@ -188,13 +212,17 @@ async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
     // 讀取原始的環境變數
     let vllm_endpoint = env::var("VLLM_ENDPOINT")
         .unwrap_or("http://localhost:11434".to_string());
+    
+    // 預設模型改為您可能使用的 (e.g., llama3, gemma2)
     let model_name = env::var("MODEL_NAME")
-        .unwrap_or("gemma2:27b".to_string());
+        .unwrap_or("llama3.1".to_string()); 
+        
     let token = env::var("BEARER_TOKEN").unwrap_or_default();
     
-
-    let base_url = vllm_endpoint.trim_end_matches('/'); // 對應 .rstrip('/')
+    // 處理 URL 結尾
+    let base_url = vllm_endpoint.trim_end_matches('/'); 
     
+    // 自動判斷是否補上 /v1/chat/completions
     let api_url = if base_url.contains("/v1") {
         format!("{}/chat/completions", base_url)
     } else {
@@ -207,16 +235,18 @@ async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
     let body = json!({
         "model": model_name, 
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
         ],
         "temperature": 0.1, // RAG 建議低溫，減少幻覺
-        "stream": false
+        "stream": false     // 您選擇不使用串流 (適合簡單處理)
     });
 
     let mut request_builder = client.post(&api_url)
         .header("Content-Type", "application/json")
         .header("User-Agent", "INSUR-RAG");
+
+    // Token 檢查邏輯
     let token_check = token.trim().to_lowercase();
     let invalid_values = ["", "none", "null"];
     if !invalid_values.contains(&token_check.as_str()) {
@@ -231,14 +261,16 @@ async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
     // 解析回應
     if res.status().is_success() {
         let response_json: Value = res.json().await?;
+        
         // 抓取 choices[0].message.content
         if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
             println!("\n💬 LLM 回答：\n==================================\n{}\n==================================", content);
         } else {
-            println!("⚠️ LLM 回應格式無法解析: {:?}", response_json);
+            println!("⚠️ LLM 回應格式無法解析 (可能無內容): {:?}", response_json);
         }
     } else {
         println!("❌ LLM 請求失敗: Status {}", res.status());
+        // 嘗試印出錯誤訊息幫助除錯
         println!("Response: {}", res.text().await?);
     }
 
@@ -348,7 +380,7 @@ async fn process_single_file(
     if table_names.contains(&TABLE_NAME.to_string()) {
         let table = db.open_table(TABLE_NAME).execute().await?;
         // 這裡需要用 iterator 包起來
-        let batches = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         table.add(Box::new(batches)).execute().await?;
     } 
     else {
@@ -361,15 +393,511 @@ async fn process_single_file(
     Ok(())
 }
 
+/* for JSON and then */
+
+// 讀取單一 JSON 檔案
+fn load_policy_json(path: &Path) -> Result<models::PolicyData, Box<dyn Error>> {
+    let content = fs::read_to_string(path)?;
+    // 使用 serde_json 解析
+    let data: models::PolicyData = serde_json::from_str(&content)?;
+    Ok(data)
+}
+
+fn chunk_policy_data(data: &models::PolicyData) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let pname = &data.basic_info.product_name;
+    let fname = &data.source_filename;
+    
+    // 🔥🔥🔥【智慧標籤系統】🔥🔥🔥
+    // 我們根據 JSON 欄位自動推導出使用者可能會搜的口語關鍵字
+    let mut tags = Vec::new();
+
+    // 1. 核心分類 (投資 vs 傳統)
+    if data.investment.is_investment_linked {
+        tags.push("投資型保單".to_string());
+        tags.push("基金保單".to_string()); // 俗稱
+        tags.push("變額保險".to_string());
+        tags.push("理財型保險".to_string());
+        tags.push("高風險高報酬".to_string()); // 特徵
+    } else {
+        tags.push("傳統型保單".to_string());
+        tags.push("固定利率".to_string());
+        tags.push("保證給付".to_string());
+    }
+
+    // 2. 功能需求 (存錢 vs 保障 vs 退休)
+    let type_desc = &data.basic_info.product_type;
+    let cov_death = &data.coverage.death_benefit;
+    let cov_maturity = &data.coverage.maturity_benefit;
+
+    // 判斷是否為「儲蓄/退休」導向
+    // 如果有「滿期金」、「生存金」或類型是「年金」
+    if type_desc.contains("年金") || cov_maturity.len() > 5 { 
+        tags.push("退休規劃".to_string());
+        tags.push("養老金".to_string());
+        tags.push("儲蓄險".to_string()); // 雖然現在法規少用此詞，但民眾愛搜
+        tags.push("存錢".to_string());
+        tags.push("現金流".to_string());
+    }
+
+    // 判斷是否為「純保障/壽險」導向
+    if type_desc.contains("壽險") || cov_death.len() > 5 {
+        tags.push("壽險保障".to_string());
+        tags.push("身故賠償".to_string());
+        tags.push("留愛給家人".to_string()); // 行銷用語
+        tags.push("資產傳承".to_string());   // 高資產族群關鍵字
+    }
+
+    // 3. 幣別特性 (美元/外幣)
+    let currencies = &data.basic_info.currency;
+    if currencies.iter().any(|c| c.contains("USD") || c.contains("美元")) {
+        tags.push("美元保單".to_string());
+        tags.push("美金保單".to_string());
+        tags.push("強勢貨幣".to_string());
+    }
+    if currencies.iter().any(|c| c != "TWD" && c != "新台幣") {
+        tags.push("外幣保單".to_string());
+        tags.push("資產配置".to_string());
+    }
+
+    // 4. 繳費方式 (躉繳/期繳)
+    let payment = &data.basic_info.payment_period;
+    if payment.contains("躉") || payment.contains("一次") {
+        tags.push("躉繳".to_string());
+        tags.push("一次繳清".to_string());
+        tags.push("單筆投資".to_string());
+    } else {
+        tags.push("期繳".to_string());
+        tags.push("分期繳費".to_string());
+    }
+
+    // 5. 特殊族群 (高齡/小孩)
+    let target = &data.rag_data.target_audience;
+    if target.contains("65歲") || target.contains("高齡") {
+        tags.push("銀髮族保單".to_string());
+        tags.push("高齡投保".to_string());
+    }
+    if target.contains("小孩") || target.contains("子女") {
+        tags.push("兒童保單".to_string());
+        tags.push("教育基金".to_string());
+    }
+
+    // 將原本的關鍵字也加進來 (去重)
+    for kw in &data.rag_data.keywords {
+        if !tags.contains(kw) {
+            tags.push(kw.clone());
+        }
+    }
+
+    // 生成標籤字串，例如: "[TAGS: 投資型, 基金, 美元保單, 退休]"
+    let tags_str = format!("[關鍵字: {}]", tags.join(", "));
+    // 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+
+    // 修改 Header，把這些強大的標籤埋進每一個向量片段
+    let header = format!("商品: {} | 來源: {} | {}", pname, fname, tags_str);
+
+    // --- 以下 Chunk 生成邏輯保持不變，但因為 Header 變強了，所有 Chunk 都變強了 ---
+
+    // Chunk 1: 基本資訊
+    let chunk_basic = format!(
+        "{} | [基本資訊] 文號: {} | 類型: {} | 繳費: {} | 幣別: {:?} | 投保年齡: {} | 保費門檻: {}",
+        header,
+        data.basic_info.product_code,
+        data.basic_info.product_type,
+        data.basic_info.payment_period,
+        data.basic_info.currency,
+        data.conditions.age_range,
+        data.conditions.premium_limit
+    );
+    chunks.push(chunk_basic);
+
+    // Chunk 2: 保障內容
+    let chunk_cov = format!(
+        "{} | [保障內容] 身故/喪葬給付: {} | 滿期/祝壽給付: {} | 其他權益: {:?}",
+        header,
+        data.coverage.death_benefit,
+        data.coverage.maturity_benefit,
+        data.coverage.other_benefits
+    );
+    chunks.push(chunk_cov);
+
+    // Chunk 3: 投資特色
+    if data.investment.is_investment_linked {
+        let chunk_inv = format!(
+            "{} | [投資特色] 此為投資型保單(基金/全委)。特色: {:?} | 風險: {:?}",
+            header,
+            data.investment.features,
+            data.investment.risks
+        );
+        chunks.push(chunk_inv);
+    }
+
+    // Chunk 4: 費用
+    let chunk_fee = format!("{} | [費用說明] {}", header, data.conditions.fees_and_discounts);
+    chunks.push(chunk_fee);
+
+    // Chunk 5: 客群
+    let chunk_meta = format!("{} | [適用客群] {} | 額外標籤: {:?}", header, data.rag_data.target_audience, tags);
+    chunks.push(chunk_meta);
+
+    // Chunk 6: FAQ
+    for faq in &data.rag_data.faq {
+        let chunk_faq = format!("{} | [常見問題] Q: {} | A: {}", header, faq.q, faq.a);
+        chunks.push(chunk_faq);
+    }
+
+    chunks
+}
+// 將 PolicyData 切分成帶有語意的文字片段 (Semantic Chunking)
+fn chunk_policy_data_old(data: &models::PolicyData) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let pname = &data.basic_info.product_name;
+    let fname = &data.source_filename;
+    
+    // Helper: 產生標準化的 Context Header
+    // 讓每一段文字都知道自己屬於哪個商品
+    let header = format!("商品: {} | 來源: {}", pname, fname);
+
+    // Chunk 1: 基本資訊與投保規則
+    // 包含: 公司、幣別、類型、年齡、保費限制
+    let chunk_basic = format!(
+        "{} | [基本資訊] 文號: {} | 類型: {} | 繳費: {} | 幣別: {:?} | 投保年齡: {} | 保費門檻: {}",
+        header,
+        data.basic_info.product_code,
+        data.basic_info.product_type,
+        data.basic_info.payment_period,
+        data.basic_info.currency,
+        data.conditions.age_range,
+        data.conditions.premium_limit
+    );
+    chunks.push(chunk_basic);
+
+    // Chunk 2: 保障內容
+    // 包含: 身故、滿期、其他
+    let chunk_cov = format!(
+        "{} | [保障內容] 身故/喪葬給付: {} | 滿期/祝壽給付: {} | 其他權益: {:?}",
+        header,
+        data.coverage.death_benefit,
+        data.coverage.maturity_benefit,
+        data.coverage.other_benefits
+    );
+    chunks.push(chunk_cov);
+
+    // Chunk 3: 投資特色 (如果有)
+    if data.investment.is_investment_linked {
+        let chunk_inv = format!(
+            "{} | [投資特色] 是否連結投資: 是 | 特色: {:?} | 風險: {:?}",
+            header,
+            data.investment.features,
+            data.investment.risks
+        );
+        chunks.push(chunk_inv);
+    }
+
+    // Chunk 4: 費用與折扣
+    let chunk_fee = format!(
+        "{} | [費用說明] {}",
+        header,
+        data.conditions.fees_and_discounts
+    );
+    chunks.push(chunk_fee);
+
+    // Chunk 5: 客群與關鍵字 (輔助搜尋)
+    let chunk_meta = format!(
+        "{} | [適用客群] {} | 關鍵字: {:?}",
+        header,
+        data.rag_data.target_audience,
+        data.rag_data.keywords
+    );
+    chunks.push(chunk_meta);
+
+    // Chunk 6~N: FAQ (黃金資料)
+    // 每一題 QA 獨立成一個 Chunk，搜尋命中率極高
+    for faq in &data.rag_data.faq {
+        let chunk_faq = format!(
+            "{} | [常見問題] Q: {} | A: {}",
+            header, faq.q, faq.a
+        );
+        chunks.push(chunk_faq);
+    }
+
+    chunks
+}
+
+// --- 2. 處理單一檔案流程 (Embedding + DB Insert) ---
+async fn process_and_index_json(
+    path: &Path,
+    table: &lancedb::Table,
+    model: &mut TextEmbedding
+) -> Result<(), Box<dyn Error>> {
+    let filename = path.file_name().unwrap().to_str().unwrap();
+    let content = fs::read_to_string(path)?;
+    let current_hash = calculate_hash(&content);
+
+    // 1. 讀取 JSON
+    let policy = match load_policy_json(path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("❌ JSON 解析失敗 {}: {}", filename, e);
+            return Ok(());
+        }
+    };
+    // 🔥🔥🔥【DIFF 核心邏輯】🔥🔥🔥
+    // 查詢 DB 中是否已有此檔案，並取出它的 file_hash
+    let where_clause = format!("source_file = '{}'", policy.source_filename);
+    
+    let results = table
+        .query()
+        .only_if(where_clause)
+        .limit(1) // 只要查一筆就知道有沒有
+        .execute()
+        .await?;
+
+    let batches: Vec<RecordBatch> = results.try_collect().await?;
+    
+    if let Some(batch) = batches.first() {
+        if batch.num_rows() > 0 {
+            // DB 裡有這個檔，檢查 Hash 是否一樣
+            if let Some(hash_col) = batch.column_by_name("file_hash") {
+                 if let Some(str_array) = hash_col.as_any().downcast_ref::<StringArray>() {
+                     let db_hash = str_array.value(0); // 取第一列的 Hash
+                     
+                     if db_hash == current_hash {
+                         println!("⏩ [跳過] 檔案未變更: {}", filename);
+                         return Ok(()); // Hash 一樣，完全不做事
+                     } else {
+                         println!("🔄 [更新] 檔案內容已變更 (Hash不同)，重新索引: {}", filename);
+                         // Hash 不同，程式會繼續往下走，執行刪除舊資料+寫入新資料
+                     }
+                 }
+            }
+        }
+    }
+    // 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+    // 2. 切分
+    let chunks = chunk_policy_data(&policy);
+    if chunks.is_empty() { return Ok(()); }
+
+    println!("🔄 正在索引: {} (產生 {} 個向量片段)", filename, chunks.len());
+
+    // 3. 向量化 (Embedding)
+    let embeddings = model.embed(chunks.clone(), None)?;
+
+    // 4. 準備寫入 LanceDB 的資料
+    let total_chunks = chunks.len();
+    let embedding_dim = 768; // BGE-Base 的維度
+
+    // 建構 Arrow Arrays
+    let source_array = StringArray::from(vec![policy.source_filename.clone(); total_chunks]);
+    let hash_array = StringArray::from(vec![current_hash; total_chunks]);
+    let text_array = StringArray::from(chunks);
+    
+    // 建構向量 Array (Flattened list)
+    let mut vector_builder = FixedSizeListBuilder::new(
+        arrow_array::builder::Float32Builder::new(),
+        embedding_dim as i32,
+    );
+    
+    for vec in embeddings {
+        for val in vec {
+            vector_builder.values().append_value(val);
+        }
+        vector_builder.append(true);
+    }
+    let vector_array = vector_builder.finish();
+
+    // 建立 RecordBatch
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("source_file", DataType::Utf8, false),
+        Field::new("file_hash", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("vector", DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            embedding_dim as i32
+        ), false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(source_array),
+            Arc::new(hash_array),
+            Arc::new(text_array),
+            Arc::new(vector_array),
+        ],
+    )?;
+
+    // 5. 寫入 DB (先刪除舊的再寫入，確保不重複)
+    // 注意：這裡我們用 source_filename 來刪除，這對應到原始 PDF/DOCX 檔名
+    let delete_filter = format!("source_file = '{}'", policy.source_filename);
+    table.delete(&delete_filter).await?;
+
+    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+    
+    table.add(Box::new(batches)).execute().await?;
+
+    Ok(())
+}
+
+// --- 3. 問答邏輯 ---
+async fn handle_user_query(
+    db: &lancedb::Connection, 
+    model: &mut TextEmbedding, 
+    user_query: &str,
+    synonyms: &HashMap<String, String>,
+    summaries: &HashMap<String, ProductSummary>
+) -> Result<(), Box<dyn Error>> {
+
+    // 0. 字典擴充
+    let mut final_query = user_query.to_string();
+    for (slang, term) in synonyms {
+        if user_query.contains(slang) {
+            println!("💡 [字典命中] '{}' -> 加上 '{}'", slang, term);
+            final_query.push_str(" ");
+            final_query.push_str(term);
+        }
+    }
+
+    // 1. 向量化問題
+    // let query_embedding = model.embed(vec![user_query.to_string()], None)?;
+    // let query_vector = query_embedding[0].clone();
+    let query_vec = model.embed(vec![final_query.clone()], None)?[0].clone();
+
+    // 2. 搜尋 DB
+    let table = db.open_table(TABLE_NAME).execute().await?;
+    let results = table
+        .query()
+        .nearest_to(query_vec)?
+        .limit(10) // 取前 3 個最相關的片段
+        .execute()
+        .await?;
+    
+    let batches: Vec<RecordBatch> = results.try_collect().await?;
+
+     // 3. 檢查結果 (簡易信心檢查: 有沒有結果)
+    let has_results = !batches.is_empty() && batches[0].num_rows() > 0;
+
+    let mut used_batches = batches;
+
+    // 4. AI 補救 (如果沒結果)
+    if !has_results {
+        println!("⚠️  初步搜尋無結果，嘗試 AI 深度擴充...");
+        if let Some(ai_kw) = expand_query_with_ai(user_query).await {
+            let ai_vec = model.embed(vec![ai_kw], None)?[0].clone();
+            let ai_results = table.query().nearest_to(ai_vec)?.limit(3).execute().await?;
+            used_batches = ai_results.try_collect().await?;
+        }
+    }
+
+    // 5. 組裝 Context (包含商品摘要)
+    let mut hit_files = HashSet::new();
+    let mut snippets_text = String::new();
+
+    println!("\n🔍 [RAG 檢索結果]");
+    for batch in &used_batches {
+        let text_col = batch.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let src_col = batch.column_by_name("source_file").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+
+        for i in 0..batch.num_rows() {
+            let src = src_col.value(i);
+            let txt = text_col.value(i);
+            hit_files.insert(src.to_string());
+            snippets_text.push_str(&format!("📄 [片段] 來源: {}\n內容: {}\n\n", src, txt));
+            // println!("   📄 來源: {} \n   📝 內容: {}\n   ---", src, text);
+            
+           // context_buffer.push_str(text);
+           // context_buffer.push('\n');
+           // if !sources.contains(&src.to_string()) {
+           //     sources.push(src.to_string());
+           // }
+        }
+    }
+
+    /* if context_buffer.is_empty() {
+        println!("⚠️  找不到相關資料。");
+        return Ok(());
+    } */
+    if hit_files.is_empty() {
+        println!("⚠️  找不到相關資料。");
+        // 這裡可以考慮呼叫 AI Expansion
+        return Ok(());
+    }
+
+    // 6. 注入摘要 (Summary Injection)
+    let mut final_context = String::new();
+    final_context.push_str("=== 相關商品基本介紹 ===\n");
+    for filename in &hit_files {
+        if let Some(summary) = summaries.get(filename) {
+            final_context.push_str(&format!("📄 來源: {}\n{}\n", filename, summary.intro));
+        }
+    }
+    final_context.push_str("========================\n\n");
+    final_context.push_str("=== 詳細檢索片段 ===\n");
+    final_context.push_str(&snippets_text);
+
+    // 7. 最後生成
+    ask_llm(&final_context, user_query).await?;
+    
+    println!("\n📚 [系統參考來源文件]");
+    let mut sorted_files: Vec<_> = hit_files.into_iter().collect();
+    sorted_files.sort(); // 排個序比較好看
+    for (idx, filename) in sorted_files.iter().enumerate() {
+        // 如果有摘要，順便印出商品名稱，更清楚
+        if let Some(summary) = summaries.get(filename) {
+            println!(" {}. {} ({})", idx + 1, summary.name, filename);
+        } else {
+            println!(" {}. {}", idx + 1, filename);
+        }
+    }
+    println!("==================================");
+    // println!("🤖 (LLM 會根據上述 Context 回答您的問題: '{}')", user_query);
+    // println!("📚 參考文件: {:?}", sources);
+
+    Ok(())
+}
+
+fn load_product_summaries() -> HashMap<String, ProductSummary> {
+    let mut summaries = HashMap::new();
+    let walker = WalkDir::new(PROCESSED_JSON_DIR).into_iter();
+    
+    for entry in walker.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "json") {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(data) = serde_json::from_str::<models::PolicyData>(&content) {
+                    
+                    // 🔥 組合出一個最強的「商品履歷」
+                    let intro = format!(
+                        "【商品總覽】\n名稱: {}\n類型: {}\n特色: {:?}\n適合對象: {}\n",
+                        data.basic_info.product_name,
+                        data.basic_info.product_type,
+                        data.investment.features, // 如果是傳統型這裡可能是空，沒關係
+                        data.rag_data.target_audience
+                    );
+
+                    summaries.insert(data.source_filename.clone(), ProductSummary {
+                        name: data.basic_info.product_name,
+                        intro,
+                    });
+                }
+            }
+        }
+    }
+    println!("📚 已快取 {} 筆商品摘要", summaries.len());
+    summaries
+}
+
 // --- Main Workflow ---
-#[tokio::main]
+/*#[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok(); // 載入環境變數
 
     // 準備資料庫 (Local File)
-    let uri = "data/lancedb_store";
+    let uri = DB_URI;
     let db = connect(uri).execute().await?;
     println!("💾 連線至 LanceDB: {}", uri);
+
 
     // 準備 Embedding 模型 (BGE-M3 或 Base)
     let mut model = TextEmbedding::try_new(
@@ -388,8 +916,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     for entry in walker.filter_map(|e| e.ok()) {
         let path = entry.path();
-        // 只處理 .pdf 檔案
-        if path.extension().map_or(false, |ext| ext == "pdf") {
+        // 只處理 .pdf 和 .docx 檔案
+        if path.extension().map_or(false, |ext| ext == "pdf" || ext == "docx") {
             // 呼叫處理函式
             if let Err(e) = process_single_file(path, &db, &mut model).await {
                 eprintln!("💥 嚴重錯誤 (Skipped): {:?}", e);
@@ -408,7 +936,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // --- 測試搜尋 ---
     // 這裡模擬使用者問問題
-    let user_query = "有哪些保單是針對30歲以上女性設計的終身壽險？";
+    let user_query = "臻美利美元利率型終身保險的主要給付項目有哪些？";
     
     // 呼叫我們剛剛寫的搜尋函式
     //search_document(&db, &mut model, user_query).await?;
@@ -447,4 +975,165 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ask_llm(&context_buffer, user_query).await?; 
 
     Ok(())
+}*/
+
+fn load_synonyms() -> HashMap<String, String> {
+    if let Ok(content) = fs::read_to_string(SYNONYMS_PATH) {
+        // 假設 JSON 格式是 {"mapping": {"口語": "術語"}}，這裡簡化處理直接讀 Map
+        // 如果您的 Python 產出是直接的 Dict，這樣寫是對的
+        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&content) {
+            println!("📚 載入離線同義詞字典: {} 筆", map.len());
+            return map;
+        } 
+        // 如果 Python 產出包含 "mapping" key，請改用 Value 解析
+    }
+    println!("⚠️ 無法載入字典 ({}). 將只使用原字串搜尋。", SYNONYMS_PATH);
+    HashMap::new()
 }
+
+// --- LLM API：擴充關鍵字 (Query Expansion) ---
+async fn expand_query_with_ai(query: &str) -> Option<String> {
+    let api_key = std::env::var("GOOGLE_API_KEY").ok()?;
+    println!("🤖 [AI 介入] 正在請求 Gemini 分析意圖: '{}'...", query);
+    
+    let client = reqwest::Client::new();
+    let prompt = format!("使用者搜尋: '{}'。請轉換為3個台灣保險專業關鍵字(如:變額萬能壽險, 月撥回)，用空白分隔，不要有其他文字。", query);
+
+    let request_body = json!({
+        "contents": [{ "parts": [{ "text": prompt }] }]
+    });
+
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", api_key);
+
+    match client.post(&url).json(&request_body).send().await {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                    let clean = text.trim().replace("\n", " ");
+                    println!("✨ AI 建議關鍵字: {}", clean);
+                    return Some(clean);
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    None
+}
+
+// --- LLM API：最終回答 (RAG Generation) ---
+async fn ask_llm_with_context(context: &str, question: &str) -> Result<(), Box<dyn Error>> {
+    let api_key = std::env::var("GOOGLE_API_KEY").expect("GOOGLE_API_KEY not found");
+    
+    let client = reqwest::Client::new();
+    let system_prompt = "你是一位專業保險顧問。請根據提供的【商品介紹】與【詳細片段】回答使用者問題。若資料不足請誠實告知。";
+    let full_prompt = format!("{}\n\n參考資料:\n{}\n\n使用者問題: {}", system_prompt, context, question);
+
+    let request_body = json!({
+        "contents": [{ "parts": [{ "text": full_prompt }] }]
+    });
+
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", api_key);
+
+    println!("🤖 正在詢問 LLM (生成回答中)...");
+    match client.post(&url).json(&request_body).send().await {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                    println!("\n💬 LLM 回答：\n==================================\n{}\n==================================", text);
+                } else {
+                    println!("❌ LLM 回傳格式錯誤或無內容");
+                }
+            } else {
+                println!("❌ 無法解析 LLM 回應");
+            }
+        }
+        Err(e) => println!("❌ API 呼叫失敗: {}", e),
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    dotenv().ok();
+
+    // 1. 初始化 DB
+    let db = connect(DB_URI).execute().await?;
+    println!("💾 連線至資料庫: {}", DB_URI);
+
+    // 建立 Table (如果不存在)
+    // 注意: 這裡定義 Schema
+    let embedding_dim = 768;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("source_file", DataType::Utf8, false),
+        Field::new("file_hash", DataType::Utf8, false), // ★ 新增這一欄
+        Field::new("text", DataType::Utf8, false),
+        Field::new("vector", DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            embedding_dim
+        ), false),
+    ]));
+
+    /* let table = db.create_table(TABLE_NAME, RecordBatchIterator::new(vec![], schema.clone()))
+        .execute_if_not_exists()
+        .await?;
+        */
+
+    let table_names = db.table_names().execute().await?;
+    let table = if table_names.contains(&TABLE_NAME.to_string()) {
+        println!("📂 資料表 '{}' 已存在，開啟中...", TABLE_NAME);
+        db.open_table(TABLE_NAME).execute().await?
+    } 
+    else {
+        println!("✨ 資料表 '{}' 不存在，建立中...", TABLE_NAME);
+        // 建立一個空的迭代器來初始化表結構
+        let batches: Vec<Result<RecordBatch, arrow_schema::ArrowError>> = vec![]; 
+        db.create_table(TABLE_NAME, RecordBatchIterator::new(batches, schema.clone()))
+            .execute()
+            .await?
+    };
+
+    // 2. 初始化 Embedding 模型
+    println!("🧠 載入 Embedding 模型 (BGE-Base)...");
+    let mut model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGEBaseENV15))?;
+    let synonyms = load_synonyms();           // <--- 這裡產生 synonyms
+    let summaries = load_product_summaries(); // <--- 這裡產生 summaries
+
+    // 3. 掃描並索引 JSON
+    println!("\n🚀 開始索引 JSON 資料夾: {}", PROCESSED_JSON_DIR);
+    if Path::new(PROCESSED_JSON_DIR).exists() {
+        let walker = WalkDir::new(PROCESSED_JSON_DIR).into_iter();
+        for entry in walker.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                // 呼叫索引函式
+                if let Err(e) = process_and_index_json(path, &table, &mut model).await {
+                    eprintln!("❌ 索引錯誤: {:?}", e);
+                }
+            }
+        }
+    } else {
+        println!("⚠️  警告: 找不到 {} 資料夾，請確認 Python 腳本是否執行成功。", PROCESSED_JSON_DIR);
+    }
+    
+    println!("\n✅ 所有資料索引完成！");
+
+    // 4. 互動模式
+    println!("\n🤖 保險 AI 顧問 (RAG CLI) 已就緒");
+    println!("💡 輸入問題 (例如: '安聯新吉星有什麼費用?' 或 'exit' 離開)");
+    
+    loop {
+        print!("\nUser > ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            let q = input.trim();
+            if q.eq_ignore_ascii_case("exit") { break; }
+            if q.is_empty() { continue; }
+
+            handle_user_query(&db, &mut model, q, &synonyms, &summaries).await?;
+        }
+    }
+
+    Ok(())
+}
+

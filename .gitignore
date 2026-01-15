@@ -3,5 +3,7 @@
 .fastembed_cache
 .DS_Store
 /data/lancedb_store
+/data/lancedb_insure
 /data/*.pdf
 /data/raw_pdfs
+/data/processed_json

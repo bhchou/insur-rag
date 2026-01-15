@@ -3639,11 +3639,13 @@ dependencies = [
  "dotenvy",
  "fastembed",
  "futures",
+ "hex",
  "lancedb",
  "pyo3",
  "reqwest 0.13.1",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "walkdir",
 ]

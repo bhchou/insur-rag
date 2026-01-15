@@ -77,3 +77,59 @@ where
         _ => Ok(Some(v.to_string())),
     }
 }
+
+/* 底下是走JSON的資料 */
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PolicyData {
+    // 這是 Python 裡塞進去的 "source_filename"
+    pub source_filename: String, 
+    pub basic_info: BasicInfo,
+    pub conditions: Conditions,
+    pub coverage: Coverage,
+    pub investment: Investment,
+    pub rag_data: RagData,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BasicInfo {
+    pub product_name: String,
+    pub product_code: String,
+    pub company: String,
+    pub currency: Vec<String>,
+    pub product_type: String,
+    pub payment_period: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Conditions {
+    pub age_range: String,
+    pub premium_limit: String,
+    pub fees_and_discounts: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Coverage {
+    pub death_benefit: String,
+    pub maturity_benefit: String,
+    pub other_benefits: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Investment {
+    pub is_investment_linked: bool,
+    pub features: Vec<String>,
+    pub risks: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RagData {
+    pub keywords: Vec<String>,
+    pub target_audience: String,
+    pub faq: Vec<FaqItem>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FaqItem {
+    pub q: String,
+    pub a: String,
+}

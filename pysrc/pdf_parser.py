@@ -7,6 +7,7 @@ import re
 from PIL import Image
 import os
 from dotenv import load_dotenv
+import docx
 
 load_dotenv()
 
@@ -199,19 +200,51 @@ def extract_text_from_pdf(file_path):
         
     return full_text
 
+def parse_docx(file_path):
+    """讀取 DOCX 並回傳純文字內容"""
+    try:
+        doc = docx.Document(file_path)
+        full_text = []
+        #讀取每個段落
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if text:
+                full_text.append(text)
+        
+        # 讀取表格 (保險條款常有表格)
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if row_text:
+                    full_text.append(" | ".join(row_text))
+                    
+        return "\n".join(full_text)
+    except Exception as e:
+        sys.stderr.write(f"Error parsing DOCX: {str(e)}\n")
+        return ""
+
 def main():
     # 檢查參數
     if len(sys.argv) < 2:
         # 錯誤訊息也輸出成 JSON 格式，方便 Rust 判讀
         print(json.dumps({"error": "No file path provided"}))
         return
+    
+    file_path = sys.argv[1]
+    ext = os.path.splitext(file_path)[1].lower()
+    
+    content = ""
 
-    pdf_path = sys.argv[1]
+    # 1. 根據副檔名分流
+    if ext == ".pdf":
+        content = extract_text_from_pdf(file_path) 
+    elif ext == ".docx":
+        content = parse_docx(file_path)
+    else:
+        sys.stderr.write(f"Unsupported file type: {ext}\n")
+        sys.exit(1)
     
-    # 1. 提取全文 (Full Text)
-    raw_text = extract_text_from_pdf(pdf_path)
-    
-    if not raw_text:
+    if not content or len(content.strip()) == 0:
         # 如果讀不到字，回傳空的結構避免 Rust 解析失敗
         final_output = {
             "metadata": {
@@ -228,7 +261,7 @@ def main():
         return
 
     # 2. 呼叫 LLM 提取 Metadata
-    metadata_json_str = extract_metadata_via_llm(raw_text)
+    metadata_json_str = extract_metadata_via_llm(content)
     
     # 嘗試解析 LLM 回傳的 JSON
     try:
@@ -245,13 +278,13 @@ def main():
             "target_audience": None
         }
 
-    # 3. 組裝最終結構
+    # 組裝最終結構
     final_output = {
         "metadata": metadata_obj,
-        "full_text": raw_text
+        "full_text": content
     }
 
-    # 4. 輸出到 Stdout (Rust 讀取目標)
+    # 輸出到 Stdout (Rust 讀取目標)
     print(json.dumps(final_output, ensure_ascii=False))
 
 if __name__ == "__main__":
