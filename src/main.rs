@@ -6,9 +6,11 @@ use serde_json::{Value, json};
 use walkdir::WalkDir;
 use sha2::{Sha256, Digest};
 use hex;
+use serde::{Serialize, Deserialize};
 
 use std::collections::{HashMap, HashSet};
 use std::env; 
+use std::f32::consts::E;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -37,6 +39,19 @@ const SYNONYMS_PATH: &str = "./data/synonyms.json";
 struct ProductSummary {
     name: String,
     intro: String, // 這裡會存：商品類型 + 特色 + 適合對象
+}
+
+// --- Rerank API 結構 ---
+#[derive(Serialize)]
+struct RerankRequest {
+    query: String,
+    documents: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RerankResponse {
+    scores: Vec<f32>,
+    indices: Vec<usize>,
 }
 
 // 輔助函式：計算字串的 SHA256 Hash
@@ -188,8 +203,27 @@ fn semantic_chunking(doc: &ParsedDocument, filename: &str) -> Vec<String> {
     chunks
 }
 
+fn load_system_prompt() -> String {
+    // 1. 嘗試從 env 讀取路徑
+    let path = env::var("SYSTEM_PROMPT_PATH").unwrap_or("./data/system_prompt.txt".to_string());
+    
+    // 2. 讀取檔案內容
+    match fs::read_to_string(path.clone()) {
+        Ok(content) => {
+            println!("📜 已載入 System Prompt ({} bytes)", content.len());
+            content
+        },
+        Err(e) => {
+            println!("⚠️ 無法讀取 Prompt 檔案 ({})，使用內建預設值。錯誤: {}", path, e);
+            // 這裡放一個最簡單的預設值當作備案
+            "你是一個專業的保險顧問。請根據參考資料回答問題。".to_string()
+        }
+    }
+}
+
 // --- 5. 生成回答 (Generation) ---
 async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
+    let system_prompt_text = load_system_prompt();
     println!("🤖 正在詢問 LLM (這可能需要幾秒鐘)...");
 
     // 1. 準備 Prompt (🔥 已升級：加入來源引用指令)
@@ -197,7 +231,8 @@ async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
     let system_prompt = "你是一個專業的保險顧問。請根據以下提供的『參考資料』(包含商品摘要與詳細片段) 回答使用者的問題。\
     \n\n重要規則：\
     \n1. 若資料中包含來源檔案名稱 (Source File)，請嘗試在回答中標註。\
-    \n2. 如果資料中沒有答案，請直接說『資料不足，無法回答』，不要捏造事實。";
+    \n2. 若資料中未提及具體保額建議，請根據保險學理（如：雙十原則）提供通用的財務規劃建議，但必須標註『此為通用建議』。\
+    \n3. 如果資料中沒有答案，請直接說『資料不足，無法回答』，不要捏造事實。";
 
     let user_prompt = format!(
         "參考資料：\n{}\n\n使用者問題：{}", 
@@ -235,7 +270,7 @@ async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
     let body = json!({
         "model": model_name, 
         "messages": [
-            { "role": "system", "content": system_prompt },
+            { "role": "system", "content": system_prompt_text },
             { "role": "user", "content": user_prompt }
         ],
         "temperature": 0.1, // RAG 建議低溫，減少幻覺
@@ -548,81 +583,6 @@ fn chunk_policy_data(data: &models::PolicyData) -> Vec<String> {
 
     chunks
 }
-// 將 PolicyData 切分成帶有語意的文字片段 (Semantic Chunking)
-fn chunk_policy_data_old(data: &models::PolicyData) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let pname = &data.basic_info.product_name;
-    let fname = &data.source_filename;
-    
-    // Helper: 產生標準化的 Context Header
-    // 讓每一段文字都知道自己屬於哪個商品
-    let header = format!("商品: {} | 來源: {}", pname, fname);
-
-    // Chunk 1: 基本資訊與投保規則
-    // 包含: 公司、幣別、類型、年齡、保費限制
-    let chunk_basic = format!(
-        "{} | [基本資訊] 文號: {} | 類型: {} | 繳費: {} | 幣別: {:?} | 投保年齡: {} | 保費門檻: {}",
-        header,
-        data.basic_info.product_code,
-        data.basic_info.product_type,
-        data.basic_info.payment_period,
-        data.basic_info.currency,
-        data.conditions.age_range,
-        data.conditions.premium_limit
-    );
-    chunks.push(chunk_basic);
-
-    // Chunk 2: 保障內容
-    // 包含: 身故、滿期、其他
-    let chunk_cov = format!(
-        "{} | [保障內容] 身故/喪葬給付: {} | 滿期/祝壽給付: {} | 其他權益: {:?}",
-        header,
-        data.coverage.death_benefit,
-        data.coverage.maturity_benefit,
-        data.coverage.other_benefits
-    );
-    chunks.push(chunk_cov);
-
-    // Chunk 3: 投資特色 (如果有)
-    if data.investment.is_investment_linked {
-        let chunk_inv = format!(
-            "{} | [投資特色] 是否連結投資: 是 | 特色: {:?} | 風險: {:?}",
-            header,
-            data.investment.features,
-            data.investment.risks
-        );
-        chunks.push(chunk_inv);
-    }
-
-    // Chunk 4: 費用與折扣
-    let chunk_fee = format!(
-        "{} | [費用說明] {}",
-        header,
-        data.conditions.fees_and_discounts
-    );
-    chunks.push(chunk_fee);
-
-    // Chunk 5: 客群與關鍵字 (輔助搜尋)
-    let chunk_meta = format!(
-        "{} | [適用客群] {} | 關鍵字: {:?}",
-        header,
-        data.rag_data.target_audience,
-        data.rag_data.keywords
-    );
-    chunks.push(chunk_meta);
-
-    // Chunk 6~N: FAQ (黃金資料)
-    // 每一題 QA 獨立成一個 Chunk，搜尋命中率極高
-    for faq in &data.rag_data.faq {
-        let chunk_faq = format!(
-            "{} | [常見問題] Q: {} | A: {}",
-            header, faq.q, faq.a
-        );
-        chunks.push(chunk_faq);
-    }
-
-    chunks
-}
 
 // --- 2. 處理單一檔案流程 (Embedding + DB Insert) ---
 async fn process_and_index_json(
@@ -749,6 +709,21 @@ async fn handle_user_query(
     summaries: &HashMap<String, ProductSummary>
 ) -> Result<(), Box<dyn Error>> {
 
+    // --- 讀取環境變數 (設定預設值以防沒設) ---
+    let recall_limit = env::var("RAG_RECALL_LIMIT")
+        .unwrap_or("20".to_string())
+        .parse::<usize>()
+        .unwrap_or(20);
+
+    let rerank_limit = env::var("RAG_RERANK_LIMIT")
+        .unwrap_or("3".to_string())
+        .parse::<usize>()
+        .unwrap_or(3);
+
+    let rerank_api = env::var("RERANK_API_URL")
+        .unwrap_or("http://localhost:8000/rerank".to_string());
+    // -------------------------------------
+
     // 0. 字典擴充
     let mut final_query = user_query.to_string();
     for (slang, term) in synonyms {
@@ -769,7 +744,7 @@ async fn handle_user_query(
     let results = table
         .query()
         .nearest_to(query_vec)?
-        .limit(10) // 取前 3 個最相關的片段
+        .limit(recall_limit) // 取前 3 個最相關的片段
         .execute()
         .await?;
     
@@ -790,28 +765,24 @@ async fn handle_user_query(
         }
     }
 
+    // 🔥🔥🔥 插入 Re-ranking 步驟 🔥🔥🔥
+    let top_results = rerank_documents(user_query, used_batches, summaries, rerank_limit, &rerank_api).await?;
+    
+    if top_results.is_empty() {
+         println!("❌ 經過 Re-ranking 後無合適資料。");
+         return Ok(());
+    }
+
     // 5. 組裝 Context (包含商品摘要)
     let mut hit_files = HashSet::new();
     let mut snippets_text = String::new();
 
     println!("\n🔍 [RAG 檢索結果]");
-    for batch in &used_batches {
-        let text_col = batch.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        let src_col = batch.column_by_name("source_file").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-
-        for i in 0..batch.num_rows() {
-            let src = src_col.value(i);
-            let txt = text_col.value(i);
-            hit_files.insert(src.to_string());
-            snippets_text.push_str(&format!("📄 [片段] 來源: {}\n內容: {}\n\n", src, txt));
-            // println!("   📄 來源: {} \n   📝 內容: {}\n   ---", src, text);
-            
-           // context_buffer.push_str(text);
-           // context_buffer.push('\n');
-           // if !sources.contains(&src.to_string()) {
-           //     sources.push(src.to_string());
-           // }
-        }
+   
+    for (src, txt, score) in &top_results {
+        hit_files.insert(src.clone());
+        // 我們可以在 context 裡稍微標註一下這是精選出來的
+        snippets_text.push_str(&format!("📄 [精選片段] (關聯度:{:.1}) 來源: {}\n內容: {}\n\n", score, src, txt));
     }
 
     /* if context_buffer.is_empty() {
@@ -857,6 +828,64 @@ async fn handle_user_query(
     Ok(())
 }
 
+// 回傳 (摘要Map, 同義詞Map)
+fn load_data_from_json_dir() -> (HashMap<String, ProductSummary>, HashMap<String, String>) {
+    let mut summaries = HashMap::new();
+    let mut synonyms = HashMap::new();
+    
+    println!("🚀 Rust 正在掃描 JSON 資料夾建立快取...");
+    
+    let walker = WalkDir::new(PROCESSED_JSON_DIR).into_iter();
+    
+    for entry in walker.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().map_or(false, |e| e == "json") {
+            if let Ok(content) = fs::read_to_string(path) {
+                // 嘗試解析 JSON
+                if let Ok(data) = serde_json::from_str::<models::PolicyData>(&content) {
+                    
+                    // --- 1. 處理摘要 (原有邏輯) ---
+                    let intro = format!(
+                        "【商品總覽】\n名稱: {}\n類型: {}\n特色: {:?}\n適合對象: {}\n",
+                        data.basic_info.product_name,
+                        data.basic_info.product_type,
+                        data.investment.features,
+                        data.rag_data.target_audience
+                    );
+
+                    summaries.insert(data.source_filename.clone(), ProductSummary {
+                        name: data.basic_info.product_name,
+                        intro,
+                    });
+
+                    // --- 2. 處理同義詞 (新增邏輯) ---
+                    // 假設 models::RagData 裡面有 synonym_mapping 欄位
+                    // 注意：您需要在 models.rs 裡對應加上這個欄位，如果沒有的話
+                    if let Some(mapping) = &data.rag_data.synonym_mapping {
+                        for entry in mapping {
+                            // 處理逗號分隔 (例如: "死掉, 走了")
+                            let slangs: Vec<&str> = entry.slang.split(&['、', ','][..]).collect();
+                            for s in slangs {
+                                let clean_s = s.trim().to_string();
+                                if !clean_s.is_empty() {
+                                    // 建立反向索引: 口語 -> 專業術語
+                                    synonyms.insert(clean_s, entry.formal.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    println!("📚 資料載入完成！");
+    println!("   - 商品摘要: {} 筆", summaries.len());
+    println!("   - 同義詞庫: {} 筆", synonyms.len());
+    
+    (summaries, synonyms)
+}
+
 fn load_product_summaries() -> HashMap<String, ProductSummary> {
     let mut summaries = HashMap::new();
     let walker = WalkDir::new(PROCESSED_JSON_DIR).into_iter();
@@ -888,95 +917,6 @@ fn load_product_summaries() -> HashMap<String, ProductSummary> {
     summaries
 }
 
-// --- Main Workflow ---
-/*#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    dotenv().ok(); // 載入環境變數
-
-    // 準備資料庫 (Local File)
-    let uri = DB_URI;
-    let db = connect(uri).execute().await?;
-    println!("💾 連線至 LanceDB: {}", uri);
-
-
-    // 準備 Embedding 模型 (BGE-M3 或 Base)
-    let mut model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::BGEBaseENV15)
-            .with_show_download_progress(true)
-    )?;
-    // 建立原始檔案目錄 (如果不存在)
-    if !Path::new(RAW_PDF_DIR).exists() {
-        std::fs::create_dir_all(RAW_PDF_DIR)?;
-        println!("⚠️ 請將 PDF 檔案放入 {} 資料夾中", RAW_PDF_DIR);
-    }
-
-    // 掃描目錄
-    println!("🔍 掃描目錄: {} ...", RAW_PDF_DIR);
-    let walker = WalkDir::new(RAW_PDF_DIR).into_iter();
-
-    for entry in walker.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        // 只處理 .pdf 和 .docx 檔案
-        if path.extension().map_or(false, |ext| ext == "pdf" || ext == "docx") {
-            // 呼叫處理函式
-            if let Err(e) = process_single_file(path, &db, &mut model).await {
-                eprintln!("💥 嚴重錯誤 (Skipped): {:?}", e);
-            }
-
-            // 處理完一個檔案，休息 200 毫秒 
-            // 讓 OS 有機會進行 I/O Flush 和記憶體回收
-            thread::sleep(Duration::from_millis(200));
-        }
-    }
-
-    println!("\n🎉 所有檔案處理完成！");
-
-    println!("✨ 資料庫寫入完成，稍等 1 秒確保寫入...");
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    // --- 測試搜尋 ---
-    // 這裡模擬使用者問問題
-    let user_query = "臻美利美元利率型終身保險的主要給付項目有哪些？";
-    
-    // 呼叫我們剛剛寫的搜尋函式
-    //search_document(&db, &mut model, user_query).await?;
-    //
-    // 為了方便，我們把 search_document 的邏輯搬過來直接在這裡搜
-    
-    println!("\n🔍 [Step 1] 正在檢索...");
-    let query_embedding = model.embed(vec![user_query.to_string()], None)?;
-    let table = db.open_table("insurance_docs").execute().await?;
-    let results = table
-        .query()
-        .nearest_to(query_embedding[0].clone())?
-        .limit(15)
-        .execute()
-        .await?;
-        
-    let batches: Vec<RecordBatch> = results.try_collect().await?;
-    
-    // 組裝 Context
-    let mut context_buffer = String::new();
-    for batch in batches {
-        let text_col = batch.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        for i in 0..batch.num_rows() {
-            context_buffer.push_str(text_col.value(i));
-            context_buffer.push('\n'); // 用換行分隔
-        }
-    }
-    // Debug Log
-    println!("\n👀 [Debug] 給 LLM 的 Context 內容預覽 (前 500 字):\n--------------------------------------------------");
-    println!("{}", context_buffer.chars().take(500).collect::<String>());
-    println!("... (共 {} 字)", context_buffer.len());
-    println!("--------------------------------------------------");
-
-    // 生成 (Generation)
-    println!("\n🧠 [Step 2] 正在生成回答...");
-    ask_llm(&context_buffer, user_query).await?; 
-
-    Ok(())
-}*/
-
 fn load_synonyms() -> HashMap<String, String> {
     if let Ok(content) = fs::read_to_string(SYNONYMS_PATH) {
         // 假設 JSON 格式是 {"mapping": {"口語": "術語"}}，這裡簡化處理直接讀 Map
@@ -991,8 +931,79 @@ fn load_synonyms() -> HashMap<String, String> {
     HashMap::new()
 }
 
-// --- LLM API：擴充關鍵字 (Query Expansion) ---
 async fn expand_query_with_ai(query: &str) -> Option<String> {
+    println!("🤖 [AI 介入] 正在請求地端 LLM (Gemma 27B) 分析意圖: '{}'...", query);
+    
+    // 1. 讀取環境變數 (與 ask_llm 使用相同的設定)
+    let vllm_endpoint = std::env::var("VLLM_ENDPOINT")
+        .unwrap_or("http://localhost:11434".to_string());
+    let model_name = std::env::var("MODEL_NAME")
+        .unwrap_or("gemma2:27b".to_string());
+    let token = std::env::var("BEARER_TOKEN").unwrap_or_default();
+
+    // 2. 處理 URL (確保指向 chat/completions)
+    let base_url = vllm_endpoint.trim_end_matches('/'); 
+    let api_url = if base_url.contains("/v1") {
+        format!("{}/chat/completions", base_url)
+    } else {
+        format!("{}/v1/chat/completions", base_url)
+    };
+
+    // 3. 設計 Prompt (這是關鍵！)
+    // 我們要嚴格限制 Gemma 不要 "聊天"，只準 "工作"
+    let system_prompt = "你是保險關鍵字專家。請將使用者的搜尋轉換為 3-5 個台灣保險專業術語，以利資料庫檢索。\
+                         \n規則：\
+                         \n1. 絕對不要輸出任何解釋、開場白或結尾。\
+                         \n2. 只輸出關鍵字，用空白分隔。\
+                         \n3. 例如：輸入『死掉賠錢』，輸出『身故給付 壽險保障 喪葬費用』。";
+    
+    let user_prompt = format!("使用者搜尋: '{}'", query);
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .ok()?;
+
+    let request_body = json!({
+        "model": model_name,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ],
+        "temperature": 0.1, // 低溫，讓它專注不發散
+        "stream": false
+    });
+
+    let mut request_builder = client.post(&api_url)
+        .header("Content-Type", "application/json");
+
+    // Token 處理
+    let token_check = token.trim().to_lowercase();
+    if !["", "none", "null"].contains(&token_check.as_str()) {
+        request_builder = request_builder.header("Authorization", format!("Bearer {}", token));
+    }
+
+    // 4. 發送與解析
+    match request_builder.json(&request_body).send().await {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(text) = json["choices"][0]["message"]["content"].as_str() {
+                    let clean_text = text.trim().replace("\n", " ");
+                    // 有時候 LLM 會忍不住加 "關鍵字："，我們把它濾掉
+                    let clean_text = clean_text.replace("關鍵字：", "").replace("Keywords:", "");
+                    
+                    println!("✨ AI 建議關鍵字: {}", clean_text);
+                    return Some(clean_text);
+                }
+            }
+        }
+        Err(e) => eprintln!("❌ 地端 API 呼叫失敗: {}", e),
+    }
+    None
+}
+
+// --- LLM API：擴充關鍵字 (Query Expansion) 退休後再用 ---
+async fn expand_query_with_ai_future(query: &str) -> Option<String> {
     let api_key = std::env::var("GOOGLE_API_KEY").ok()?;
     println!("🤖 [AI 介入] 正在請求 Gemini 分析意圖: '{}'...", query);
     
@@ -1020,7 +1031,100 @@ async fn expand_query_with_ai(query: &str) -> Option<String> {
     None
 }
 
-// --- LLM API：最終回答 (RAG Generation) ---
+async fn rerank_documents(
+    query: &str,
+    batches: Vec<RecordBatch>,
+    summaries: &HashMap<String, ProductSummary>,
+    top_k: usize,
+    api_url: &str
+) -> Result<Vec<(String, String, f32)>, Box<dyn Error>> {
+
+    let max_chunks_per_doc = env::var("MAX_CHUNKS_PER_DOC")
+        .unwrap_or("3".to_string())
+        .parse::<usize>()
+        .unwrap_or(3);
+    
+    // 1. 先把所有 LanceDB 的結果解開成純文字列表
+    let mut raw_docs: Vec<(String, String)> = Vec::new(); // (source, text)
+    let mut doc_texts_for_api: Vec<String> = Vec::new();
+
+    for batch in &batches {
+        let text_col = batch.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let src_col = batch.column_by_name("source_file").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        
+        for i in 0..batch.num_rows() {
+            let src = src_col.value(i).to_string();
+            let txt = text_col.value(i).to_string();
+            
+            // 為了讓 Re-ranker 判斷準確，我們把「摘要」也加進去給它讀
+            // 這樣它才知道 "優利精選" 是投資型保單
+            let content_for_judge = if let Some(sum) = summaries.get(&src) {
+                format!("{}\n文件內容: {}", sum.intro, txt)
+            } else {
+                txt.clone()
+            };
+
+            raw_docs.push((src, txt));
+            doc_texts_for_api.push(content_for_judge);
+        }
+    }
+
+    if raw_docs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2. 呼叫 Python Re-ranker API
+    let client = reqwest::Client::new();
+    let request_body = RerankRequest {
+        query: query.to_string(),
+        documents: doc_texts_for_api,
+    };
+
+    println!("⚖️ 正在進行 Re-ranking ({} 筆候選, 取 Top {})...", raw_docs.len(), top_k);
+
+    // 假設 Python Server 跑在 localhost:8009
+    // 如果您用 Docker 或其他配置，請改 URL
+    let resp = client.post(api_url)
+        .json(&request_body)
+        .send()
+        .await?;
+
+    let rerank_res: RerankResponse = resp.json().await?;
+
+    // 3. 根據回傳的 indices 重新組裝結果
+    let mut ranked_results = Vec::new();
+    let mut file_counts: HashMap<String, usize> = HashMap::new();
+    
+    for (i, &original_idx) in rerank_res.indices.iter().enumerate() {
+        if ranked_results.len() >= top_k { break; }
+        
+        let score = rerank_res.scores[i];
+        
+        // 💡 進階技巧：可以在這裡設一個「門檻值」
+        // BGE-Re-ranker 的分數通常在 -10 ~ +10 之間 (Logits)
+        // 負分通常代表不相關
+        if score < -5.0 { 
+            continue; 
+        }
+
+        let (src, txt) = &raw_docs[original_idx];
+        // 檢查這份檔案是否已經額滿
+        let count = file_counts.entry(src.clone()).or_insert(0);
+        
+        if *count < max_chunks_per_doc {
+            println!("   ⭐ [Top {}] 分數: {:.2} | 來源: {}", i+1, score, src);
+            ranked_results.push((src.clone(), txt.clone(), score));
+            *count += 1;
+        }
+        else {
+            println!("   ⏭️ [跳過] 檔案額滿 ({}/{}): {:.2} | 來源: {}", *count, max_chunks_per_doc, score, src);
+        }
+    }
+
+    Ok(ranked_results)
+}
+
+// --- LLM API：最終回答 (RAG Generation) 這部分退休後用 ---
 async fn ask_llm_with_context(context: &str, question: &str) -> Result<(), Box<dyn Error>> {
     let api_key = std::env::var("GOOGLE_API_KEY").expect("GOOGLE_API_KEY not found");
     
@@ -1073,11 +1177,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ), false),
     ]));
 
-    /* let table = db.create_table(TABLE_NAME, RecordBatchIterator::new(vec![], schema.clone()))
-        .execute_if_not_exists()
-        .await?;
-        */
-
     let table_names = db.table_names().execute().await?;
     let table = if table_names.contains(&TABLE_NAME.to_string()) {
         println!("📂 資料表 '{}' 已存在，開啟中...", TABLE_NAME);
@@ -1095,8 +1194,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 2. 初始化 Embedding 模型
     println!("🧠 載入 Embedding 模型 (BGE-Base)...");
     let mut model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGEBaseENV15))?;
-    let synonyms = load_synonyms();           // <--- 這裡產生 synonyms
-    let summaries = load_product_summaries(); // <--- 這裡產生 summaries
+    // let synonyms = load_synonyms();           // <--- 這裡產生 synonyms
+    // let summaries = load_product_summaries(); // <--- 這裡產生 summaries
+    let (summaries, synonyms) = load_data_from_json_dir();
 
     // 3. 掃描並索引 JSON
     println!("\n🚀 開始索引 JSON 資料夾: {}", PROCESSED_JSON_DIR);

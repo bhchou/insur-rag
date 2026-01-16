@@ -121,11 +121,18 @@ pub struct Investment {
     pub risks: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SynonymEntry {
+    pub slang: String,
+    pub formal: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RagData {
     pub keywords: Vec<String>,
     pub target_audience: String,
     pub faq: Vec<FaqItem>,
+    pub synonym_mapping: Option<Vec<SynonymEntry>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

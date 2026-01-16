@@ -24,7 +24,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --- 2. 定義資料結構 (Pydantic Schema) ---
 # 新版 SDK 支援直接傳入 Pydantic Class，這樣 Gemini 就絕對不會吐錯格式！
-
+# 同義詞是多出來的, 在跑DOCX時還沒有, 下次重跑PDF時再補
+class SynonymEntry(BaseModel):
+    slang: str = Field(description="客戶常說的口語 (如: 死掉, 殘廢, 存錢)")
+    formal: str = Field(description="對應的保單專業術語 (如: 身故給付, 完全失能)")
 class FaqItem(BaseModel):
     q: str = Field(description="使用者可能問的問題")
     a: str = Field(description="根據文件的簡短回答")
@@ -54,6 +57,7 @@ class Investment(BaseModel):
 
 class RagData(BaseModel):
     keywords: List[str] = Field(description="RAG 檢索用的關鍵字與同義詞")
+    synonym_mapping: List[SynonymEntry] = Field(description="口語與專業術語對照表")
     target_audience: str = Field(description="適合客群描述")
     faq: List[FaqItem] = Field(description="5-8 組常見問答")
 
@@ -94,8 +98,31 @@ def process_single_pdf(pdf_path, filename):
         print("   🤖 Gemini 分析提取中 (Using Pydantic Schema)...")
         
         # B. 生成內容 (使用 Structured Output)
+        """
+        👉 gemini-2.5-flash
+👉 gemini-2.0-flash-exp
+👉 gemini-2.0-flash
+👉 gemini-2.0-flash-001
+👉 gemini-2.0-flash-exp-image-generation
+👉 gemini-2.0-flash-lite-001
+👉 gemini-2.0-flash-lite
+👉 gemini-2.0-flash-lite-preview-02-05
+👉 gemini-2.0-flash-lite-preview
+👉 gemini-2.5-flash-preview-tts
+👉 gemini-flash-latest
+👉 gemini-flash-lite-latest
+👉 gemini-2.5-flash-lite
+👉 gemini-2.5-flash-image-preview
+👉 gemini-2.5-flash-image
+👉 gemini-2.5-flash-preview-09-2025
+👉 gemini-2.5-flash-lite-preview-09-2025
+👉 gemini-3-flash-preview
+👉 gemini-2.5-flash-native-audio-latest
+👉 gemini-2.5-flash-native-audio-preview-09-2025
+👉 gemini-2.5-flash-native-audio-preview-12-2025
+        """
         response = client.models.generate_content(
-            model="gemini-2.0-flash-001", # 或 gemini-2.0-flash 如果你有權限
+            model="gemini-2.5-flash-lite", # 或 gemini-2.0-flash 如果你有權限
             contents=[
                 file_content,
                 "你是一位資深的保險精算師。請從這份保單中精確提取資料。請注意 product_code (文號) 的準確性。"
