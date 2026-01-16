@@ -67,13 +67,15 @@ graph TD
 .
 ├── Cargo.toml              # Rust 專案設定
 ├── data/
+│   ├── raw_pdfs/           # [Input] 原始 PDF 保單
 │   ├── raw_docx/           # [Input] 原始 Word 保單
 │   ├── processed_json/     # [Output] ETL 產出的結構化資料
 │   ├── system_prompt.txt   # [Config] AI 顧問的核心指令集
 │   └── lancedb_insure/     # [DB] 向量資料庫檔案
 ├── pysrc/
-│   ├── etl_docx_to_json.py # 核心 ETL 程式 (含同義詞與客群標籤生成)
-│   └── rerank_server.py    # (Optional) Re-ranker API Server
+│   ├── etl_docx_to_json.py # 核心 ETL 程式 
+│   ├── etl_pdf_to_json.py  # 核心 ETL 程式 
+│   └── rerank_server.py    # Re-ranker API Server
 ├── src/
 │   ├── main.rs             # Rust 主程式 (RAG Pipeline)
 │   └── models.rs           # 資料結構定義
