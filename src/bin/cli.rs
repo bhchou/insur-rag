@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = init_system().await?;
     
     println!("\n🤖 保險 AI 顧問 (CLI 版) 已就緒");
-    println!("💡 輸入問題 (例如: '安聯新吉星有什麼費用?' 或 'exit' 離開)");
+    println!("💡 輸入問題 (例如: '安聯新吉星有什麼費用?' 或 'exit' 離開; 若提到產品名稱可以用單雙引號,括號,或中文引號『「』」《》【】框起來會更準)");
 
     // 2. 進入互動迴圈
     loop {

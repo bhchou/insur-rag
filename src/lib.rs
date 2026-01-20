@@ -7,9 +7,11 @@ use walkdir::WalkDir;
 use sha2::{Sha256, Digest};
 use hex;
 use serde::{Serialize, Deserialize};
+use regex::Regex;
 
 use std::collections::{HashMap, HashSet};
 use std::env; 
+use std::os::linux::raw;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -781,6 +783,59 @@ pub async fn process_query(
         }
     }
 
+    let mut forced_candidates: Vec<(String, String, f32)> = Vec::new();
+    let mut forced_filenames = HashSet::new();
+
+    // 1. 提取括弧內的文字 (支援 『』 「」 或 "")
+    // 這邊假設使用者會用這些常見括弧
+    let re = Regex::new(r#"[『「《【“"‘'（\(](.*?)[」』》】”"’'）\)]"#).unwrap();
+    
+    for cap in re.captures_iter(user_query) {
+        let keyword = &cap[1]; // 提取到的關鍵字，例如 "活利優退"
+        println!("🎯 偵測到明確意圖關鍵字: {}", keyword);
+
+        // 2. 掃描 Summary 找對應檔案
+        for (filename, summary) in &state.summaries {
+            // 規則：只要檔名或商品全名包含這個關鍵字 -> 命中
+            if filename.contains(keyword) || summary.name.contains(keyword) {
+                println!("✅ 鎖定檔案: {}", filename);
+                forced_filenames.insert(filename.clone());
+            }
+        }
+    }
+    // 3. 如果有鎖定的檔案，直接去 DB 撈出來 (不透過向量搜尋)
+    if !forced_filenames.is_empty() {
+        // 組裝 SQL Filter: source_file = 'A' OR source_file = 'B'
+        let filter_cond = forced_filenames
+            .iter()
+            .map(|f| format!("source_file = '{}'", f))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let table = state.db.open_table(TABLE_NAME).execute().await?;
+        let specific_results = table
+            .query()
+            .only_if(filter_cond)
+            .limit(10) // 每個檔案抓前幾段摘要即可
+            .execute()
+            .await?;
+
+        let batches: Vec<RecordBatch> = specific_results.try_collect().await?;
+        
+        // 將結果轉為 candidates 格式
+        for batch in batches {
+            let src_col = batch.column_by_name("source_file").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let txt_col = batch.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            
+            for i in 0..batch.num_rows() {
+                let src = src_col.value(i).to_string();
+                let txt = txt_col.value(i).to_string();
+                // 🔥 給予無限大的分數 (f32::INFINITY)，確保它在 Re-rank 前絕對是第一名
+                forced_candidates.push((src, txt, f32::INFINITY));
+            }
+        }
+    }
+
     // 1. 向量化問題
     // let query_embedding = model.embed(vec![user_query.to_string()], None)?;
     // let query_vector = query_embedding[0].clone();
@@ -797,7 +852,7 @@ pub async fn process_query(
     
     let batches: Vec<RecordBatch> = results.try_collect().await?;
 
-     // 3. 檢查結果 (簡易信心檢查: 有沒有結果)
+     // 4. 檢查結果 (簡易信心檢查: 有沒有結果)
     let has_results = !batches.is_empty() && batches[0].num_rows() > 0;
 
     let mut used_batches = batches;
@@ -812,8 +867,33 @@ pub async fn process_query(
         }
     }
 
+    let mut raw_candidates: Vec<(String, String)> = Vec::new();
+    let mut seen_texts = HashSet::new();
+
+    // 1. 先加入 [強制命中] 的 (優先放入)
+    for (src, txt, _) in forced_candidates {
+        if seen_texts.insert(txt.clone()) {
+            raw_candidates.push((src, txt));
+        }
+    }
+
+    // 2. 再加入 [向量搜尋] 的 (解包 Arrow)
+    for b in used_batches {
+        let src_col = b.column_by_name("source_file").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let txt_col = b.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+
+        for i in 0..b.num_rows() {
+            let src = src_col.value(i).to_string();
+            let txt = txt_col.value(i).to_string();
+        
+            // 去重：如果這段文字已經被強制命中加過了，就跳過
+            if seen_texts.insert(txt.clone()) {
+                raw_candidates.push((src, txt));
+            }
+        }
+    }
     // 🔥🔥🔥 插入 Re-ranking 步驟 🔥🔥🔥
-    let top_results = rerank_documents(user_query, used_batches, summaries, rerank_limit, &rerank_api).await?;
+    let top_results = rerank_documents(user_query, raw_candidates, summaries, rerank_limit, &rerank_api).await?;
     
     if top_results.is_empty() {
         return Ok(RagResponse {
@@ -1088,9 +1168,12 @@ async fn expand_query_with_ai_future(query: &str) -> Option<String> {
     None
 }
 
+// src/lib.rs
+
+// ✅ 修改函式簽名：輸入改為 candidates: Vec<(String, String)>
 async fn rerank_documents(
     query: &str,
-    batches: Vec<RecordBatch>,
+    candidates: Vec<(String, String)>, // (source_file, text)
     summaries: &HashMap<String, ProductSummary>,
     top_k: usize,
     api_url: &str
@@ -1101,33 +1184,23 @@ async fn rerank_documents(
         .parse::<usize>()
         .unwrap_or(3);
     
-    // 1. 先把所有 LanceDB 的結果解開成純文字列表
-    let mut raw_docs: Vec<(String, String)> = Vec::new(); // (source, text)
-    let mut doc_texts_for_api: Vec<String> = Vec::new();
-
-    for batch in &batches {
-        let text_col = batch.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        let src_col = batch.column_by_name("source_file").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        
-        for i in 0..batch.num_rows() {
-            let src = src_col.value(i).to_string();
-            let txt = text_col.value(i).to_string();
-            
-            // 為了讓 Re-ranker 判斷準確，我們把「摘要」也加進去給它讀
-            // 這樣它才知道 "優利精選" 是投資型保單
-            let content_for_judge = if let Some(sum) = summaries.get(&src) {
-                format!("{}\n文件內容: {}", sum.intro, txt)
-            } else {
-                txt.clone()
-            };
-
-            raw_docs.push((src, txt));
-            doc_texts_for_api.push(content_for_judge);
-        }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
     }
 
-    if raw_docs.is_empty() {
-        return Ok(Vec::new());
+    // 1. 準備給 Re-ranker API 的資料
+    // 我們需要保留原始的 (src, txt) 對應關係，同時準備一份「注入摘要」的版本給 AI 讀
+    let mut doc_texts_for_api: Vec<String> = Vec::new();
+
+    for (src, txt) in &candidates {
+        // 為了讓 Re-ranker 判斷準確，我們把「摘要」也加進去給它讀
+        // 這樣它才知道 "優利精選" 是投資型保單
+        let content_for_judge = if let Some(sum) = summaries.get(src) {
+            format!("{}\n文件內容: {}", sum.intro, txt)
+        } else {
+            txt.clone()
+        };
+        doc_texts_for_api.push(content_for_judge);
     }
 
     // 2. 呼叫 Python Re-ranker API
@@ -1137,10 +1210,8 @@ async fn rerank_documents(
         documents: doc_texts_for_api,
     };
 
-    println!("⚖️ 正在進行 Re-ranking ({} 筆候選, 取 Top {})...", raw_docs.len(), top_k);
+    println!("⚖️ 正在進行 Re-ranking ({} 筆候選, 取 Top {})...", candidates.len(), top_k);
 
-    // 假設 Python Server 跑在 localhost:8009
-    // 如果您用 Docker 或其他配置，請改 URL
     let resp = client.post(api_url)
         .json(&request_body)
         .send()
@@ -1157,15 +1228,16 @@ async fn rerank_documents(
         
         let score = rerank_res.scores[i];
         
-        // 💡 進階技巧：可以在這裡設一個「門檻值」
-        // BGE-Re-ranker 的分數通常在 -10 ~ +10 之間 (Logits)
-        // 負分通常代表不相關
+        // 💡 門檻值過濾
         if score < -5.0 { 
             continue; 
         }
 
-        let (src, txt) = &raw_docs[original_idx];
-        // 檢查這份檔案是否已經額滿
+        // 🔥 關鍵改變：直接從傳入的 candidates 取值
+        // original_idx 是 Python 回傳的原始索引，對應到 candidates 的順序
+        let (src, txt) = &candidates[original_idx];
+        
+        // 檢查這份檔案是否已經額滿 (多樣性過濾)
         let count = file_counts.entry(src.clone()).or_insert(0);
         
         if *count < max_chunks_per_doc {
@@ -1180,7 +1252,6 @@ async fn rerank_documents(
 
     Ok(ranked_results)
 }
-
 
 
 // 4. 新增初始化函式 (從原本 main 提取)

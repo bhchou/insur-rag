@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 保險顧問 (RAG Demo)</title>
+    <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        body { font-family: "Microsoft JhengHei", system-ui, sans-serif; }
+        
+        /* 自定義捲軸 */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        /* 思考過程摺疊區塊樣式 */
+        details.thinking-process {
+            background-color: #f0f9ff;
+            border: 1px solid #bae6fd;
+            border-radius: 8px;
+            padding: 0.5rem;
+            margin-bottom: 1rem;
+            font-size: 0.9em;
+        }
+        details.thinking-process summary {
+            cursor: pointer;
+            color: #0369a1;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        details.thinking-process summary:hover { text-decoration: underline; }
+        
+        /* Markdown 表格優化 */
+        .prose table { font-size: 0.9em; margin-top: 1em; margin-bottom: 1em; }
+        .prose thead th { background-color: #f8fafc; color: #1e293b; padding: 0.5em; }
+        .prose td { padding: 0.5em; }
+        
+        .loading-dots:after { content: ' .'; animation: dots 1s steps(5, end) infinite;}
+        @keyframes dots { 0%, 20% { content: ' .'; } 40% { content: ' ..'; } 60% { content: ' ...'; } 80%, 100% { content: ''; }}
+    </style>
+</head>
+<body class="bg-slate-50 h-screen flex flex-col">
+
+    <header class="bg-white shadow-sm px-6 py-4 flex items-center justify-between z-10">
+        <div class="flex items-center gap-3">
+            <div class="w-10 h-10 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-lg flex items-center justify-center text-white text-xl shadow-md">🛡️</div>
+            <div>
+                <h1 class="font-bold text-slate-800 text-lg">企業級保險 RAG 系統</h1>
+                <p class="text-xs text-slate-500">Rust Core • Hybrid Search • Re-ranking</p>
+            </div>
+        </div>
+        <div class="text-xs text-slate-400 font-mono bg-slate-100 px-2 py-1 rounded">v2.0 (Stable)</div>
+    </header>
+
+    <div id="chat-container" class="flex-1 overflow-y-auto p-4 space-y-6 scroll-smooth pb-24">
+        <div class="flex gap-4 max-w-4xl mx-auto animate-fade-in">
+            <div class="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-lg flex-shrink-0">🤖</div>
+            <div class="bg-white p-6 rounded-2xl rounded-tl-none shadow-sm border border-slate-100 max-w-[85%]">
+                <h3 class="font-bold text-slate-800 mb-2">您好！我是您的 AI 保險助手</h3>
+                <p class="text-slate-600 text-sm mb-4">我已連接內部知識庫，支援<b>語意搜尋</b>與<b>精準關鍵字鎖定</b>。</p>
+                <div class="space-y-2">
+                    <button onclick="fillInput('請幫我規劃一份適合營造業工人的意外險方案')" class="block w-full text-left text-xs bg-slate-50 hover:bg-indigo-50 text-slate-600 p-2 rounded transition border border-slate-200">
+                        👷 範例：請幫我規劃一份適合營造業工人的意外險方案
+                    </button>
+                    <button onclick="fillInput('請根據『活利優退』這份DM製作退休簡報大綱')" class="block w-full text-left text-xs bg-slate-50 hover:bg-indigo-50 text-slate-600 p-2 rounded transition border border-slate-200">
+                        📄 範例：請根據『活利優退』這份DM製作退休簡報大綱
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="bg-white border-t border-slate-200 p-4 fixed bottom-0 w-full z-20">
+        <form id="chat-form" class="max-w-4xl mx-auto relative flex gap-2">
+            <input type="text" id="user-input" 
+                class="flex-1 bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm transition"
+                placeholder="輸入您的問題...產品名稱可以用單雙引號,括號,或中文引號『「』」《》【】框起來" autocomplete="off">
+            <button type="submit" 
+                class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2 rounded-xl font-medium shadow-md transition transform active:scale-95 flex items-center gap-2">
+                <span>發送</span>
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+            </button>
+        </form>
+        <p class="text-center text-[10px] text-slate-400 mt-2">AI 生成內容僅供參考，實際條款以保單為準</p>
+    </div>
+
+    <script>
+        const container = document.getElementById('chat-container');
+        const form = document.getElementById('chat-form');
+        const input = document.getElementById('user-input');
+
+        function fillInput(text) {
+            input.value = text;
+            input.focus();
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const msg = input.value.trim();
+            if(!msg) return;
+
+            appendUserMessage(msg);
+            input.value = '';
+            
+            const loadingId = appendLoading();
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ message: msg })
+                });
+                const data = await res.json();
+                removeElement(loadingId);
+                appendAiMessage(data.answer, data.sources);
+            } catch (err) {
+                removeElement(loadingId);
+                appendAiMessage("❌ 連線錯誤，請確認後端是否啟動。", []);
+                console.error(err);
+            }
+        });
+
+        function appendUserMessage(text) {
+            const div = document.createElement('div');
+            div.className = "flex justify-end gap-4 max-w-4xl mx-auto animate-fade-in";
+            div.innerHTML = `
+                <div class="bg-indigo-600 text-white p-4 rounded-2xl rounded-tr-none shadow-md max-w-[85%] text-sm leading-relaxed">
+                    ${escapeHtml(text)}
+                </div>
+            `;
+            container.appendChild(div);
+            scrollToBottom();
+        }
+
+        function appendAiMessage(markdown, sources) {
+            const div = document.createElement('div');
+            div.className = "flex gap-4 max-w-4xl mx-auto animate-fade-in";
+            
+            // 處理來源列表
+            let sourceHtml = '';
+            if (sources && sources.length > 0) {
+                sourceHtml = `<div class="mt-4 pt-4 border-t border-slate-100">
+                    <p class="text-xs font-bold text-slate-500 mb-2">📚 參考來源：</p>
+                    <ul class="text-xs text-slate-400 space-y-1 list-disc pl-4">
+                        ${sources.map(s => `<li>${s}</li>`).join('')}
+                    </ul>
+                </div>`;
+            }
+
+            // 使用 tailwind typography (prose) 來渲染 Markdown
+            div.innerHTML = `
+                <div class="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-lg flex-shrink-0">🤖</div>
+                <div class="bg-white p-6 rounded-2xl rounded-tl-none shadow-sm border border-slate-100 max-w-[85%] prose prose-sm prose-slate max-w-none">
+                    ${marked.parse(markdown)}
+                    ${sourceHtml}
+                </div>
+            `;
+            container.appendChild(div);
+            scrollToBottom();
+        }
+
+        function appendLoading() {
+            const id = 'loader-' + Date.now();
+            const div = document.createElement('div');
+            div.id = id;
+            div.className = "flex gap-4 max-w-4xl mx-auto animate-fade-in";
+            div.innerHTML = `
+                <div class="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-lg flex-shrink-0">🤖</div>
+                <div class="bg-white p-4 rounded-2xl rounded-tl-none shadow-sm border border-slate-100 text-slate-500 text-sm">
+                    正在分析保單條款<span class="loading-dots"></span>
+                </div>
+            `;
+            container.appendChild(div);
+            scrollToBottom();
+            return id;
+        }
+
+        function removeElement(id) {
+            const el = document.getElementById(id);
+            if(el) el.remove();
+        }
+
+        function scrollToBottom() {
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        }
+    </script>
+</body>
+</html>

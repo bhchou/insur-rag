@@ -13,7 +13,8 @@ MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 print(f"⏳ 正在載入 Re-ranker 模型: {MODEL_NAME} ...")
 
 # 判斷是否有 GPU (WSL2 若有設定好 CUDA 就能用，沒有就跑 CPU)
-device = "cuda" if torch.cuda.is_available() else "cpu"
+#device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 print(f"🚀 運算裝置: {device}")
 
 # 載入 CrossEncoder
