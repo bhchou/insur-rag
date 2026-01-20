@@ -1,0 +1,7 @@
+fastembed
+lancedb
+google-genai
+python-docx
+pydantic
+python-dotenv
+

@@ -1,4 +1,4 @@
-mod models;
+pub mod models;
 
 use futures::TryStreamExt;
 use dotenvy::dotenv; 
@@ -19,6 +19,7 @@ use std::thread;
 use std::time::{self, Duration};
 use std::fs;
 use std::io::{self, Write};
+use tokio::sync::Mutex;
 
 use models::ParsedDocument;
 
@@ -36,9 +37,9 @@ const TABLE_NAME: &str = "insurance_docs";
 const SYNONYMS_PATH: &str = "./data/synonyms.json";
 
 #[derive(Clone)]
-struct ProductSummary {
-    name: String,
-    intro: String, // 這裡會存：商品類型 + 特色 + 適合對象
+pub struct ProductSummary {
+    pub name: String,
+    pub intro: String, // 這裡會存：商品類型 + 特色 + 適合對象
 }
 
 // --- Rerank API 結構 ---
@@ -53,6 +54,15 @@ struct RerankResponse {
     scores: Vec<f32>,
     indices: Vec<usize>,
 }
+
+pub struct AppState {
+    pub db: lancedb::Connection,
+    pub model: Mutex<TextEmbedding>, // 注意：Model 不是線程安全的，要加 Mutex
+    pub synonyms: HashMap<String, String>,
+    pub summaries: HashMap<String, ProductSummary>,
+}
+
+
 
 // 輔助函式：計算字串的 SHA256 Hash
 fn calculate_hash(content: &str) -> String {
@@ -701,7 +711,29 @@ async fn process_and_index_json(
 }
 
 // --- 3. 問答邏輯 ---
-async fn handle_user_query(
+pub async fn process_query(
+    state: &Arc<AppState>,
+    user_query: &str,
+) -> Result<(), Box<dyn Error>> {
+    // 這裡要把 state 解開來用
+    // 原本: &mut model -> 現在: &mut *state.model.lock().await
+    let mut model = state.model.lock().await; 
+    
+    // 呼叫原本內部的邏輯 (handle_user_query 的內容搬過來)
+    // 注意：原本的 handle_user_query 需要 model, db, synonyms...
+    // 現在都可以從 state 拿到
+    
+    // 暫時直接呼叫舊邏輯 (為了省時，您可以保留舊的 handle_user_query 在 lib.rs 下方，只是改成接受 state)
+    handle_user_query_internal(
+        &state.db, 
+        &mut *model, 
+        user_query, 
+        &state.synonyms, 
+        &state.summaries
+    ).await
+}
+
+async fn handle_user_query_internal(
     db: &lancedb::Connection, 
     model: &mut TextEmbedding, 
     user_query: &str,
@@ -808,7 +840,7 @@ async fn handle_user_query(
     final_context.push_str(&snippets_text);
 
     // 7. 最後生成
-    ask_llm(&final_context, user_query).await?;
+    //ask_llm(&final_context, user_query).await?;
     
     println!("\n📚 [系統參考來源文件]");
     let mut sorted_files: Vec<_> = hit_files.into_iter().collect();
@@ -1156,6 +1188,56 @@ async fn ask_llm_with_context(context: &str, question: &str) -> Result<(), Box<d
     Ok(())
 }
 
+// 4. 新增初始化函式 (從原本 main 提取)
+pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
+    dotenv().ok();
+    
+    // 初始化 DB
+    let db = connect(DB_URI).execute().await?;
+    println!("💾 連線至資料庫: {}", DB_URI);
+
+    //建立 Table (如果不存在)
+    // 注意: 這裡定義 Schema
+    let embedding_dim = 768;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("source_file", DataType::Utf8, false),
+        Field::new("file_hash", DataType::Utf8, false), // ★ 新增這一欄
+        Field::new("text", DataType::Utf8, false),
+        Field::new("vector", DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            embedding_dim
+        ), false),
+    ]));
+
+    let table_names = db.table_names().execute().await?;
+    let table = if table_names.contains(&TABLE_NAME.to_string()) {
+        println!("📂 資料表 '{}' 已存在，開啟中...", TABLE_NAME);
+        db.open_table(TABLE_NAME).execute().await?
+    } 
+    else {
+        println!("✨ 資料表 '{}' 不存在，建立中...", TABLE_NAME);
+        // 建立一個空的迭代器來初始化表結構
+        let batches: Vec<Result<RecordBatch, arrow_schema::ArrowError>> = vec![]; 
+        db.create_table(TABLE_NAME, RecordBatchIterator::new(batches, schema.clone()))
+            .execute()
+            .await?
+    };
+    
+    println!("🧠 載入 Embedding 模型...");
+    let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGEBaseENV15))?;
+    
+    // 載入資料 (這裡假設您已經合併了讀取函式，或保留原本分開的)
+    let summaries = load_product_summaries(); 
+    let synonyms = load_synonyms();
+
+    Ok(Arc::new(AppState {
+        db,
+        model: Mutex::new(model),
+        synonyms,
+        summaries,
+    }))
+}
+/* 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
@@ -1236,4 +1318,4 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
-
+*/

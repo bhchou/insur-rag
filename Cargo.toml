@@ -14,7 +14,7 @@ futures = "0.3.31"
 hex = "0.4.3"
 lancedb = "0.23.1"
 # PyO3 用來呼叫 Python，auto-initialize 功能會自動尋找環境
-pyo3 = { version = "0.27.2", features = ["auto-initialize"] }
+# pyo3 = { version = "0.27.2", features = ["auto-initialize"] }
 reqwest = { version = "0.13.1", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -22,3 +22,10 @@ sha2 = "0.10.9"
 tokio = { version = "1.49.0", features = ["full"] }
 walkdir = "2.4" # 之後掃描目錄用，先加進來
 
+[lib]
+name = "insur_rag"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cli"
+path = "src/bin/cli.rs"
