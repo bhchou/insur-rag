@@ -10,15 +10,13 @@ use serde::{Serialize, Deserialize};
 
 use std::collections::{HashMap, HashSet};
 use std::env; 
-use std::f32::consts::E;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::error::Error;
 use std::thread;
-use std::time::{self, Duration};
+use std::time;
 use std::fs;
-use std::io::{self, Write};
 use tokio::sync::Mutex;
 
 use models::ParsedDocument;
@@ -30,7 +28,6 @@ use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, builder::Float3
 use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
 
 // --- 設定區 ---
-const RAW_PDF_DIR: &str = "./data/raw_pdfs"; // 請建立此資料夾並放入您的 100 個 PDF
 const PROCESSED_JSON_DIR: &str = "./data/processed_json";
 const DB_URI: &str = "data/lancedb_insure";
 const TABLE_NAME: &str = "insurance_docs";
@@ -60,8 +57,17 @@ pub struct AppState {
     pub model: Mutex<TextEmbedding>, // 注意：Model 不是線程安全的，要加 Mutex
     pub synonyms: HashMap<String, String>,
     pub summaries: HashMap<String, ProductSummary>,
+    pub llm_provider: String,
+    pub google_api_key: String,
+    pub local_llm_url: String,
+    pub local_llm_model: String,
 }
 
+#[derive(Serialize, Debug)]
+pub struct RagResponse {
+    pub answer: String,
+    pub sources: Vec<String>,
+}
 
 
 // 輔助函式：計算字串的 SHA256 Hash
@@ -232,17 +238,21 @@ fn load_system_prompt() -> String {
 }
 
 // --- 5. 生成回答 (Generation) ---
-async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
+async fn ask_llm(state: &Arc<AppState>, context: &str, query: &str) -> Result<String, Box<dyn Error>> {
+    match state.llm_provider.as_str() {
+        "local" => ask_local_llm(state, context, query).await,
+        "google" => ask_google_gemini(state, context, query).await,
+        _ => {
+            println!("⚠️ 未知 Provider: {}，預設使用 Google", state.llm_provider);
+            ask_google_gemini(state, context, query).await
+        }
+    }
+}
+
+async fn ask_local_llm(state: &Arc<AppState>, context: &str, query: &str) -> Result<String, Box<dyn Error>> {
     let system_prompt_text = load_system_prompt();
     println!("🤖 正在詢問 LLM (這可能需要幾秒鐘)...");
 
-    // 1. 準備 Prompt (🔥 已升級：加入來源引用指令)
-    // 我們告訴 LLM，如果 context 裡有檔名，盡量在回答時帶出來
-    let system_prompt = "你是一個專業的保險顧問。請根據以下提供的『參考資料』(包含商品摘要與詳細片段) 回答使用者的問題。\
-    \n\n重要規則：\
-    \n1. 若資料中包含來源檔案名稱 (Source File)，請嘗試在回答中標註。\
-    \n2. 若資料中未提及具體保額建議，請根據保險學理（如：雙十原則）提供通用的財務規劃建議，但必須標註『此為通用建議』。\
-    \n3. 如果資料中沒有答案，請直接說『資料不足，無法回答』，不要捏造事實。";
 
     let user_prompt = format!(
         "參考資料：\n{}\n\n使用者問題：{}", 
@@ -254,23 +264,13 @@ async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
         .no_proxy() // 不要管 http_proxy/HTTP_PROXY
         .build()?; 
     
-    // 讀取原始的環境變數
-    let vllm_endpoint = env::var("VLLM_ENDPOINT")
-        .unwrap_or("http://localhost:11434".to_string());
-    
-    // 預設模型改為您可能使用的 (e.g., llama3, gemma2)
-    let model_name = env::var("MODEL_NAME")
-        .unwrap_or("llama3.1".to_string()); 
-        
     let token = env::var("BEARER_TOKEN").unwrap_or_default();
     
-    // 處理 URL 結尾
-    let base_url = vllm_endpoint.trim_end_matches('/'); 
-    
-    // 自動判斷是否補上 /v1/chat/completions
+    let base_url = state.local_llm_url.trim_end_matches('/');     
     let api_url = if base_url.contains("/v1") {
         format!("{}/chat/completions", base_url)
-    } else {
+    } 
+    else {
         format!("{}/v1/chat/completions", base_url)
     };
 
@@ -278,13 +278,13 @@ async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
     
     // 發送請求 (OpenAI Compatible API 格式)
     let body = json!({
-        "model": model_name, 
+        "model": state.local_llm_model, 
         "messages": [
             { "role": "system", "content": system_prompt_text },
             { "role": "user", "content": user_prompt }
         ],
-        "temperature": 0.1, // RAG 建議低溫，減少幻覺
-        "stream": false     // 您選擇不使用串流 (適合簡單處理)
+        "temperature": 0.1, 
+        "stream": false     
     });
 
     let mut request_builder = client.post(&api_url)
@@ -309,17 +309,52 @@ async fn ask_llm(context: &str, query: &str) -> Result<(), Box<dyn Error>> {
         
         // 抓取 choices[0].message.content
         if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
-            println!("\n💬 LLM 回答：\n==================================\n{}\n==================================", content);
-        } else {
-            println!("⚠️ LLM 回應格式無法解析 (可能無內容): {:?}", response_json);
+            // println!("\n💬 LLM 回答：\n==================================\n{}\n==================================", content);
+            return Ok(content.to_string())
+        } 
+        else {
+            return Err(format!("LLM 回應格式錯誤，無法找到回答內容: {:?}", response_json).into());
         }
-    } else {
-        println!("❌ LLM 請求失敗: Status {}", res.status());
-        // 嘗試印出錯誤訊息幫助除錯
-        println!("Response: {}", res.text().await?);
+    } 
+    else {
+        return Err(format!("❌ LLM 請求失敗: Status {}\nResponse: {}", res.status(), res.text().await?).into());
+
     }
 
-    Ok(())
+}
+
+// --- LLM API：最終回答 (RAG Generation) 這部分退休後用 ---
+async fn ask_google_gemini(state: &Arc<AppState>, context: &str, query: &str) -> Result<String, Box<dyn Error>> {
+    // 檢查有沒有 Key
+    if state.google_api_key.is_empty() {
+        return Err("缺少 GOOGLE_API_KEY".into());
+    }    
+    let system_prompt_text = load_system_prompt();
+    let client = reqwest::Client::new();
+    let full_prompt = format!("{}\n\n參考資料:\n{}\n\n使用者問題: {}", system_prompt_text, context, query);
+
+    let request_body = json!({
+        "contents": [{ "parts": [{ "text": full_prompt }] }]
+    });
+
+    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
+                    state.google_api_key);
+
+    match client.post(&url).json(&request_body).send().await {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                    return Ok(text.to_string());
+                } 
+                else {
+                    return Err("❌ LLM 回傳格式錯誤或無內容".into());
+                }
+            } else {
+                return Err("❌ 無法解析 LLM 回應".into());
+            }
+        }
+        Err(e) => return Err(format!("❌ API 呼叫失敗: {}", e).into())
+    }
 }
 
 // --- 單檔處理核心邏輯 (Core Logic) ---
@@ -714,32 +749,12 @@ async fn process_and_index_json(
 pub async fn process_query(
     state: &Arc<AppState>,
     user_query: &str,
-) -> Result<(), Box<dyn Error>> {
-    // 這裡要把 state 解開來用
-    // 原本: &mut model -> 現在: &mut *state.model.lock().await
+) -> Result<RagResponse, Box<dyn Error>> {
+    
     let mut model = state.model.lock().await; 
-    
-    // 呼叫原本內部的邏輯 (handle_user_query 的內容搬過來)
-    // 注意：原本的 handle_user_query 需要 model, db, synonyms...
-    // 現在都可以從 state 拿到
-    
-    // 暫時直接呼叫舊邏輯 (為了省時，您可以保留舊的 handle_user_query 在 lib.rs 下方，只是改成接受 state)
-    handle_user_query_internal(
-        &state.db, 
-        &mut *model, 
-        user_query, 
-        &state.synonyms, 
-        &state.summaries
-    ).await
-}
-
-async fn handle_user_query_internal(
-    db: &lancedb::Connection, 
-    model: &mut TextEmbedding, 
-    user_query: &str,
-    synonyms: &HashMap<String, String>,
-    summaries: &HashMap<String, ProductSummary>
-) -> Result<(), Box<dyn Error>> {
+    let db = &state.db;
+    let synonyms = &state.synonyms;
+    let summaries = &state.summaries;
 
     // --- 讀取環境變數 (設定預設值以防沒設) ---
     let recall_limit = env::var("RAG_RECALL_LIMIT")
@@ -801,8 +816,10 @@ async fn handle_user_query_internal(
     let top_results = rerank_documents(user_query, used_batches, summaries, rerank_limit, &rerank_api).await?;
     
     if top_results.is_empty() {
-         println!("❌ 經過 Re-ranking 後無合適資料。");
-         return Ok(());
+        return Ok(RagResponse {
+            answer: "資料庫中找不到相關資訊。".to_string(),
+            sources: vec![],
+        });
     }
 
     // 5. 組裝 Context (包含商品摘要)
@@ -817,15 +834,12 @@ async fn handle_user_query_internal(
         snippets_text.push_str(&format!("📄 [精選片段] (關聯度:{:.1}) 來源: {}\n內容: {}\n\n", score, src, txt));
     }
 
-    /* if context_buffer.is_empty() {
-        println!("⚠️  找不到相關資料。");
-        return Ok(());
-    } */
-    if hit_files.is_empty() {
+
+/*    if hit_files.is_empty() {
         println!("⚠️  找不到相關資料。");
         // 這裡可以考慮呼叫 AI Expansion
         return Ok(());
-    }
+    } */
 
     // 6. 注入摘要 (Summary Injection)
     let mut final_context = String::new();
@@ -841,7 +855,9 @@ async fn handle_user_query_internal(
 
     // 7. 最後生成
     //ask_llm(&final_context, user_query).await?;
+    let llm_answer = ask_llm(state, &final_context, user_query).await?;
     
+    /*
     println!("\n📚 [系統參考來源文件]");
     let mut sorted_files: Vec<_> = hit_files.into_iter().collect();
     sorted_files.sort(); // 排個序比較好看
@@ -857,7 +873,16 @@ async fn handle_user_query_internal(
     // println!("🤖 (LLM 會根據上述 Context 回答您的問題: '{}')", user_query);
     // println!("📚 參考文件: {:?}", sources);
 
-    Ok(())
+    Ok(()) */
+    // 整理來源列表
+    let mut sorted_sources: Vec<String> = hit_files.into_iter().collect();
+    sorted_sources.sort();
+
+    // ✅ 回傳結構化資料
+    Ok(RagResponse {
+        answer: llm_answer,
+        sources: sorted_sources,
+    })
 }
 
 // 回傳 (摘要Map, 同義詞Map)
@@ -1156,37 +1181,7 @@ async fn rerank_documents(
     Ok(ranked_results)
 }
 
-// --- LLM API：最終回答 (RAG Generation) 這部分退休後用 ---
-async fn ask_llm_with_context(context: &str, question: &str) -> Result<(), Box<dyn Error>> {
-    let api_key = std::env::var("GOOGLE_API_KEY").expect("GOOGLE_API_KEY not found");
-    
-    let client = reqwest::Client::new();
-    let system_prompt = "你是一位專業保險顧問。請根據提供的【商品介紹】與【詳細片段】回答使用者問題。若資料不足請誠實告知。";
-    let full_prompt = format!("{}\n\n參考資料:\n{}\n\n使用者問題: {}", system_prompt, context, question);
 
-    let request_body = json!({
-        "contents": [{ "parts": [{ "text": full_prompt }] }]
-    });
-
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", api_key);
-
-    println!("🤖 正在詢問 LLM (生成回答中)...");
-    match client.post(&url).json(&request_body).send().await {
-        Ok(resp) => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-                    println!("\n💬 LLM 回答：\n==================================\n{}\n==================================", text);
-                } else {
-                    println!("❌ LLM 回傳格式錯誤或無內容");
-                }
-            } else {
-                println!("❌ 無法解析 LLM 回應");
-            }
-        }
-        Err(e) => println!("❌ API 呼叫失敗: {}", e),
-    }
-    Ok(())
-}
 
 // 4. 新增初始化函式 (從原本 main 提取)
 pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
@@ -1227,14 +1222,23 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
     let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGEBaseENV15))?;
     
     // 載入資料 (這裡假設您已經合併了讀取函式，或保留原本分開的)
-    let summaries = load_product_summaries(); 
-    let synonyms = load_synonyms();
+    //let summaries = load_product_summaries(); 
+    //let synonyms = load_synonyms();
+    let (summaries, synonyms) = load_data_from_json_dir();
+    let llm_provider = env::var("LLM_PROVIDER").unwrap_or("google".to_string());
+    let google_api_key = env::var("GOOGLE_API_KEY").unwrap_or_default();
+    let local_llm_url = env::var("VLLM_ENDPOINT").unwrap_or("http://localhost:8000/v1/chat/completions".to_string());
+    let local_llm_model = env::var("MODEL_NAME").unwrap_or("local-model".to_string());
 
     Ok(Arc::new(AppState {
         db,
         model: Mutex::new(model),
         synonyms,
         summaries,
+        llm_provider,
+        google_api_key,
+        local_llm_url,
+        local_llm_model,
     }))
 }
 /* 
