@@ -30,8 +30,7 @@ async fn main() {
         Err(e) => panic!("❌ 系統初始化失敗: {}", e),
     };
 
-    println!("✅ 系統就緒，Web Server 監聽中: http://localhost:3001");
-
+   
     // 2. 設定路由
     let app = Router::new()
         // API 接口
@@ -43,7 +42,14 @@ async fn main() {
         .with_state(state);
 
     // 3. 啟動服務
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
+    let port = std::env::var("PORT")
+        .unwrap_or("8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080);
+
+    println!("✅ 系統就緒，Web Server 監聽中: http://localhost:{}", port);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

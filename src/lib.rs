@@ -1210,7 +1210,7 @@ async fn rerank_documents(
         documents: doc_texts_for_api,
     };
 
-    println!("⚖️ 正在進行 Re-ranking ({} 筆候選, 取 Top {})...", candidates.len(), top_k);
+    println!("⚖️ 正在進行 Re-ranking ({} 筆候選, 取 Top {} 到 {})...", candidates.len(), top_k, api_url);
 
     let resp = client.post(api_url)
         .json(&request_body)
@@ -1258,9 +1258,12 @@ async fn rerank_documents(
 pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
     dotenv().ok();
     
+    let db_path = std::env::var("LANCEDB_PATH").unwrap_or(DB_URI.to_string());
+    println!("📂 連接 LanceDB 路徑: {}", db_path);
+    let db = connect(&db_path).execute().await?;
     // 初始化 DB
-    let db = connect(DB_URI).execute().await?;
-    println!("💾 連線至資料庫: {}", DB_URI);
+    //let db = connect(DB_URI).execute().await?;
+    //println!("💾 連線至資料庫: {}", DB_URI);
 
     //建立 Table (如果不存在)
     // 注意: 這裡定義 Schema

@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  web:
+    build: 
+      context: .
+      network: host
+      args:
+        HTTP_PROXY: ${HTTP_PROXY}
+        HTTPS_PROXY: ${HTTPS_PROXY}
+        http_proxy: ${HTTP_PROXY}
+        https_proxy: ${HTTPS_PROXY}
+    container_name: rag_web
+    ports:
+      - "8081:8081"
+    
+    # 1. 讀取您的 .env 檔案 (載入 LLM 設定、Key、RAG 參數)
+    env_file:
+      - .env
+
+    # 2. 環境變數覆寫 (針對 Docker 環境的修正)
+    environment:
+      # [修正 DB 路徑] 
+      # 強制容器內部讀取這個掛載點，忽略 .env 或 Global Constant
+      - LANCEDB_PATH=/app/lancedb_data
+
+      # [修正 Reranker 連線] 
+      # 您的 .env 寫的是 localhost，但在容器內要改成 host.docker.internal 才能連回 WSL2
+      - RERANK_API_URL=http://host.docker.internal:8009/rerank
+      
+      # [System Prompt 路徑]
+      # 確保與容器內的路徑一致 (WORKDIR 是 /app，所以是 relative path)
+      - SYSTEM_PROMPT_PATH=./data/system_prompt.txt
+
+      # 🔥 [關鍵修正 2] 讓 Rust 程式執行時也能過 Proxy
+      - NO_PROXY=localhost,127.0.0.1,host.docker.internal
+      # 小寫的通常也要設，以防萬一
+      - no_proxy=localhost,127.0.0.1,host.docker.internal
+
+    volumes:
+      # [前端熱更新]
+      - ./frontend:/app/frontend
+
+      # [System Prompt] 大腦設定
+      - ./data/system_prompt.txt:/app/data/system_prompt.txt
+
+      # [資料庫] 把宿主機的 data/lancedb_insure 掛進去
+      # ⚠️ 請確認宿主機的這個路徑是正確的 DB 位置
+      - ./data/lancedb_insure:/app/lancedb_data
+      - ./data/processed_json:/app/data/processed_json
+      
+    # 讓容器可以連到 WSL2 (為了 Re-ranker)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
