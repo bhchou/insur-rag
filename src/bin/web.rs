@@ -1,21 +1,27 @@
 // src/bin/web.rs
 
-use insur_rag::{init_system, process_query, AppState, RagResponse};
+use insur_rag::{init_system, process_query, AppState};
 use axum::{
     extract::State,
-    routing::{get, post},
+    routing::post,
     Json, Router,
 };
 use tower_http::services::ServeDir;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 // 前端傳來的請求格式
 #[derive(Deserialize)]
 struct ChatRequest {
-    message: String,
+    query: String,
+    
+    // 🔥 前端必須傳這個欄位，如果沒傳就是空陣列
+    #[serde(default)] 
+    messages: Vec<Value>, 
 }
+
 
 #[tokio::main]
 async fn main() {
@@ -57,20 +63,30 @@ async fn main() {
 // 處理 Chat 請求
 async fn chat_handler(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ChatRequest>,
-) -> Json<RagResponse> {
-    println!("📩 收到 Web 請求: {}", payload.message);
+    Json(payload): Json<ChatRequest>, // 自動解析 JSON
+) -> Json<serde_json::Value> {
+    
+    println!("📩 收到 Web 請求: {}", payload.query);
 
-    // 呼叫核心邏輯
-    match process_query(&state, &payload.message).await {
-        Ok(response) => Json(response),
+    // 🔥 3. 把 payload 裡的 messages 傳給 process_query
+    match process_query(&state, &payload.messages, &payload.query).await {
+        Ok(rag_result) => {
+            // 🔥 修正關鍵：手動拆解 rag_result
+            Json(json!({
+                "status": "success",
+                
+                // 1. 把文字內容取出來，給前端的 "answer" 欄位
+                "answer": rag_result.answer,   
+                
+                // 2. 把來源列表取出來，給前端的 "sources" 欄位
+                "sources": rag_result.sources  
+            }))
+        },
         Err(e) => {
-            eprintln!("❌ 處理錯誤: {}", e);
-            // 發生錯誤時回傳一個空的錯誤訊息 (或是你可以自定義錯誤結構)
-            Json(RagResponse {
-                answer: format!("系統發生錯誤: {}", e),
-                sources: vec![],
-            })
+            Json(json!({
+                "status": "error",
+                "message": e.to_string()
+            }))
         }
     }
 }

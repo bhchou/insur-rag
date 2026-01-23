@@ -1,4 +1,4 @@
-version: '3.8'
+#version: '3.8'
 
 services:
   web:
@@ -10,6 +10,8 @@ services:
         HTTPS_PROXY: ${HTTPS_PROXY}
         http_proxy: ${HTTP_PROXY}
         https_proxy: ${HTTPS_PROXY}
+        USER_ID: ${UID:-1000}
+        GROUP_ID: ${GID:-1000}
     container_name: rag_web
     ports:
       - "8081:8081"

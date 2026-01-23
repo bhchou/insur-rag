@@ -112,7 +112,10 @@
                 const res = await fetch('/api/chat', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ message: msg })
+                    body: JSON.stringify({ 
+                        query: msg,         // ✅ 修正 1: Key 改為 "query"
+                        messages: []        // ✅ 修正 2: 補上歷史紀錄欄位 (目前先傳空陣列)
+                    })
                 });
                 const data = await res.json();
                 removeElement(loadingId);

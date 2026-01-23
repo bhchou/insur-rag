@@ -3,7 +3,7 @@
 # ========================
 # 🔥 [重大改變] 改用 Ubuntu 24.04
 # 這能確保 glibc 版本 >= 2.38，解決 __isoc23_strtol 錯誤
-FROM ubuntu:24.04 as builder
+FROM ubuntu:24.04 AS builder
 
 WORKDIR /app
 
@@ -50,11 +50,21 @@ COPY src ./src
 RUN touch src/main.rs src/lib.rs src/bin/web.rs && \
     cargo build --release --bin web -j 4
 
+# 🔥 [瘦身關鍵] 移除 Debug Symbol
+# 這步通常能把 150MB 的執行檔變成 15MB
+RUN strip /app/target/release/web
+
 # ========================
 # Stage 2: Runtime (執行層)
 # ========================
 # 🔥 Runtime 也要用 Ubuntu 24.04，確保 glibc 版本一致
 FROM ubuntu:24.04
+
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+# 建立使用者，不要用 root 跑 (Trivy 很在意這點)
+RUN groupadd -g ${GROUP_ID} appuser && \
+    useradd -m -u ${USER_ID} -g appuser appuser
 
 WORKDIR /app
 
@@ -63,13 +73,18 @@ RUN echo "Acquire::https::Verify-Peer \"false\";" > /etc/apt/apt.conf.d/99ignore
     apt-get update && apt-get install -y \
     openssl \
     ca-certificates \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # 複製 Binary
 COPY --from=builder /app/target/release/web /app/server
 
 # 建立資料夾
-RUN mkdir -p data frontend
+RUN mkdir -p data frontend data/processed_json lancedb_data
+
+# 🔥 3. [關鍵一步] 更改權限 (把 /app 下所有東西送給 appuser)
+# 如果沒做這步，appuser 之後會無法寫入 /app/data 或產生 log
+RUN chown -R appuser:appuser /app
 
 # 環境變數
 ENV RUST_LOG=info
@@ -77,5 +92,8 @@ ENV HOST=0.0.0.0
 ENV PORT=8081
 
 EXPOSE 8081
+
+# 切換非 root 使用者
+USER appuser
 
 CMD ["/app/server"]
