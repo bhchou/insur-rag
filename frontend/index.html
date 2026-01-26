@@ -93,6 +93,9 @@
         const form = document.getElementById('chat-form');
         const input = document.getElementById('user-input');
 
+        // 🔥 1. 新增全域變數來儲存對話歷史
+        let chatHistory = [];
+        
         function fillInput(text) {
             input.value = text;
             input.focus();
@@ -105,7 +108,8 @@
 
             appendUserMessage(msg);
             input.value = '';
-            
+            // 🔥 2. 在送出前，將使用者訊息推入歷史紀錄
+            chatHistory.push({ "role": "user", "content": msg });
             const loadingId = appendLoading();
 
             try {
@@ -114,16 +118,39 @@
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ 
                         query: msg,         // ✅ 修正 1: Key 改為 "query"
-                        messages: []        // ✅ 修正 2: 補上歷史紀錄欄位 (目前先傳空陣列)
+                        messages: chatHistory.slice(-6)        // ✅ 修正 2: 補上歷史紀錄欄位 (目前先傳空陣列)
                     })
                 });
+                if (!res.ok) {
+                    const errText = await res.text();
+                    throw new Error(`伺服器錯誤 (${res.status}): ${errText}`);
+                }
                 const data = await res.json();
                 removeElement(loadingId);
+                // 防呆處理：確保 answer 是字串 (避免之前巢狀結構的問題)
+            // 如果後端傳來的是 { answer: { answer: "...", sources: [] } } 也能相容
+                let answerText = "";
+                let sourcesList = [];
+
+                if (typeof data.answer === 'string') {
+                    answerText = data.answer;
+                    sourcesList = data.sources || [];
+                } 
+                else if (data.answer && data.answer.answer) {
+                // 相容舊版巢狀結構
+                    answerText = data.answer.answer;
+                    sourcesList = data.answer.sources || [];
+                }
                 appendAiMessage(data.answer, data.sources);
-            } catch (err) {
+                // 🔥 5. 將 AI 的回答也推入歷史紀錄 (這樣下一輪才能接續)
+                chatHistory.push({ "role": "assistant", "content": answerText });
+            } 
+            catch (err) {
                 removeElement(loadingId);
                 appendAiMessage("❌ 連線錯誤，請確認後端是否啟動。", []);
                 console.error(err);
+                // 🔥 6. 如果失敗，把剛剛推入的使用者訊息移除，避免歷史錯亂
+                chatHistory.pop();
             }
         });
 
