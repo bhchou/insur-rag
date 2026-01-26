@@ -15,6 +15,8 @@ use std::error::Error;
 use std::fs;
 use tokio::sync::Mutex;
 
+use redis::Client;
+
 // LanceDB 與 Arrow 相關引入
 use lancedb::{connect, query::{ExecutableQuery, QueryBase}};
 use arrow_schema::{Schema, Field, DataType};
@@ -54,6 +56,7 @@ pub struct AppState {
     pub google_api_key: String,
     pub local_llm_url: String,
     pub local_llm_model: String,
+    pub redis_client: Option<Client>,
 }
 
 #[derive(Serialize, Debug)]
@@ -844,6 +847,25 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
     let local_llm_url = env::var("VLLM_ENDPOINT").unwrap_or("http://localhost:8000/v1/chat/completions".to_string());
     let local_llm_model = env::var("MODEL_NAME").unwrap_or("local-model".to_string());
 
+    let redis_client = match env::var("REDIS_URL") {
+        Ok(url) => {
+            match Client::open(url) {
+                Ok(client) => {
+                    println!("✅ Redis 連線設定成功");
+                    Some(client)
+                },
+                Err(e) => {
+                    eprintln!("⚠️ Redis URL 格式錯誤，將使用純前端記憶模式: {}", e);
+                    None
+                }
+            }
+        },
+        Err(_) => {
+            println!("ℹ️ 未設定 REDIS_URL，將使用純前端記憶模式");
+            None
+        }
+    };
+
     Ok(Arc::new(AppState {
         db,
         model: Mutex::new(model),
@@ -853,5 +875,6 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
         google_api_key,
         local_llm_url,
         local_llm_model,
+        redis_client,
     }))
 }

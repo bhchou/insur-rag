@@ -95,6 +95,11 @@
 
         // 🔥 1. 新增全域變數來儲存對話歷史
         let chatHistory = [];
+        let sessionId = localStorage.getItem('chat_session_id');
+        if (!sessionId) {
+            sessionId = 'user-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+            localStorage.setItem('chat_session_id', sessionId);
+        }
         
         function fillInput(text) {
             input.value = text;
@@ -118,7 +123,8 @@
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ 
                         query: msg,         // ✅ 修正 1: Key 改為 "query"
-                        messages: chatHistory.slice(-6)        // ✅ 修正 2: 補上歷史紀錄欄位 (目前先傳空陣列)
+                        messages: chatHistory.slice(-6),        // ✅ 修正 2: 補上歷史紀錄欄位 (目前先傳空陣列)
+                        session_id: sessionId
                     })
                 });
                 if (!res.ok) {

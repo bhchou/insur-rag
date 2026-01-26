@@ -5,53 +5,55 @@ use axum::{
     extract::State,
     routing::post,
     Json, Router,
+    http::StatusCode,
 };
-use tower_http::services::ServeDir;
+use tower_http::services::ServeDir; // 🔥 關鍵模組
 use std::sync::Arc;
 use std::net::SocketAddr;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use redis::AsyncCommands;
 
-// 前端傳來的請求格式
+// 定義回傳給前端的格式
+#[derive(Serialize)]
+struct ChatResponse {
+    answer: String,
+    sources: Vec<String>,
+}
+
+// 定義前端傳來的請求格式
 #[derive(Deserialize)]
 struct ChatRequest {
     query: String,
-    
-    // 🔥 前端必須傳這個欄位，如果沒傳就是空陣列
     #[serde(default)] 
     messages: Vec<Value>, 
+    #[serde(default)]
+    session_id: Option<String>,
 }
-
 
 #[tokio::main]
 async fn main() {
-    // 初始化 Log
     tracing_subscriber::fmt::init();
-    
     println!("🌐 啟動 Web Server 初始化...");
     
-    // 1. 初始化核心系統 (跟 CLI 一樣！)
     let state = match init_system().await {
         Ok(s) => s,
         Err(e) => panic!("❌ 系統初始化失敗: {}", e),
     };
 
-   
-    // 2. 設定路由
     let app = Router::new()
-        // API 接口
+        // 🔥 API 路由優先
         .route("/api/chat", post(chat_handler))
-        // 2. 所有沒對應到的路由 (例如 index.html, css, js)，全部交給 fallback 處理
-        // ❌ 舊寫法 (會 Panic): .nest_service("/", ServeDir::new("frontend"))
-        // ✅ 新寫法 (Axum 0.7+):
+        
+        // 🔥 靜態檔案路由 (Fallback)
+        // 所有沒對應到的 URL，都會去 "frontend" 資料夾找檔案
+        // 訪問 / 會自動找 index.html
         .fallback_service(ServeDir::new("frontend"))
+        
         .with_state(state);
 
-    // 3. 啟動服務
-    let port = std::env::var("PORT")
-        .unwrap_or("8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
+    let port_str = std::env::var("PORT").unwrap_or("8080".to_string());
+    let port = port_str.parse::<u16>().unwrap_or(8080);
 
     println!("✅ 系統就緒，Web Server 監聽中: http://localhost:{}", port);
 
@@ -60,33 +62,58 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-// 處理 Chat 請求
 async fn chat_handler(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ChatRequest>, // 自動解析 JSON
-) -> Json<serde_json::Value> {
+    Json(payload): Json<ChatRequest>,
+) -> Result<Json<ChatResponse>, (StatusCode, String)> {
     
-    println!("📩 收到 Web 請求: {}", payload.query);
+    // --- 1. 混合記憶邏輯 ---
+    let mut history = payload.messages.clone();
+    let mut use_redis = false;
+    let redis_key = payload.session_id.as_ref().map(|id| format!("chat:{}", id));
 
-    // 🔥 3. 把 payload 裡的 messages 傳給 process_query
-    match process_query(&state, &payload.messages, &payload.query).await {
-        Ok(rag_result) => {
-            // 🔥 修正關鍵：手動拆解 rag_result
-            Json(json!({
-                "status": "success",
-                
-                // 1. 把文字內容取出來，給前端的 "answer" 欄位
-                "answer": rag_result.answer,   
-                
-                // 2. 把來源列表取出來，給前端的 "sources" 欄位
-                "sources": rag_result.sources  
-            }))
-        },
-        Err(e) => {
-            Json(json!({
-                "status": "error",
-                "message": e.to_string()
-            }))
+    if let (Some(client), Some(key)) = (&state.redis_client, &redis_key) {
+        if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+            let redis_history: Result<Vec<String>, _> = conn.lrange(key, -10, -1).await;
+            if let Ok(hist_json) = redis_history {
+                if !hist_json.is_empty() {
+                    println!("🧠 [Redis] 成功載入 {} 筆歷史紀錄", hist_json.len());
+                    history = hist_json.iter()
+                        .filter_map(|s| serde_json::from_str(s).ok())
+                        .collect();
+                    use_redis = true;
+                }
+            }
         }
     }
+
+    if !use_redis {
+        println!("📝 [Fallback] 使用前端傳送的歷史紀錄");
+    }
+
+    // --- 2. 呼叫核心 ---
+    println!("📩 收到請求: {}", payload.query);
+    let rag_result = process_query(&state, &history, &payload.query).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // --- 3. 寫回 Redis ---
+    if use_redis {
+        if let (Some(client), Some(key)) = (&state.redis_client, &redis_key) {
+            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                let user_msg = json!({"role": "user", "content": payload.query});
+                let ai_msg = json!({"role": "assistant", "content": rag_result.answer});
+
+                let _: redis::RedisResult<()> = redis::pipe()
+                    .rpush(key, user_msg.to_string())
+                    .rpush(key, ai_msg.to_string())
+                    .expire(key, 86400)
+                    .query_async(&mut conn).await;
+            }
+        }
+    }
+
+    Ok(Json(ChatResponse {
+        answer: rag_result.answer,
+        sources: rag_result.sources,
+    }))
 }
