@@ -79,10 +79,21 @@
             <input type="text" id="user-input" 
                 class="flex-1 bg-slate-50 border border-slate-300 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm transition"
                 placeholder="輸入您的問題...產品名稱可以用單雙引號,括號,或中文引號『「』」《》【】框起來" autocomplete="off">
+            
             <button type="submit" 
                 class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2 rounded-xl font-medium shadow-md transition transform active:scale-95 flex items-center gap-2">
                 <span>發送</span>
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+            </button>
+            
+            <button 
+                type="button"
+                onclick="resetSession()"
+                class="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded shadow-md transition duration-200 flex items-center gap-2 rounded-xl">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-5 h-5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+                </svg>
+                <span>重新對話</span>
             </button>
         </form>
         <p class="text-center text-[10px] text-slate-400 mt-2">AI 生成內容僅供參考，實際條款以保單為準</p>
@@ -93,14 +104,29 @@
         const form = document.getElementById('chat-form');
         const input = document.getElementById('user-input');
 
-        // 🔥 1. 新增全域變數來儲存對話歷史
+        // 🔥 1. 初始化 Session ID 與對話歷史
+        // 使用者重新整理(F5)時，這裡會從 LocalStorage 讀取舊 ID，所以對話不會斷
         let chatHistory = [];
-        let sessionId = localStorage.getItem('chat_session_id');
+        const STORAGE_KEY = 'chat_session_id';
+        let sessionId = localStorage.getItem(STORAGE_KEY);
+        
         if (!sessionId) {
             sessionId = 'user-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-            localStorage.setItem('chat_session_id', sessionId);
+            localStorage.setItem(STORAGE_KEY, sessionId);
         }
         
+        console.log("Current Session ID:", sessionId);
+
+        // 🔥 2. 重置對話功能 (綁定給紅色按鈕)
+        function resetSession() {
+            if (confirm("確定要清除所有對話紀錄並開始新對話嗎？")) {
+                // 清除 LocalStorage
+                localStorage.removeItem(STORAGE_KEY);
+                // 重新整理頁面 -> 上面的初始化代碼會產生全新的 Session ID
+                window.location.reload();
+            }
+        }
+
         function fillInput(text) {
             input.value = text;
             input.focus();
@@ -113,7 +139,8 @@
 
             appendUserMessage(msg);
             input.value = '';
-            // 🔥 2. 在送出前，將使用者訊息推入歷史紀錄
+            
+            // 記錄到前端歷史
             chatHistory.push({ "role": "user", "content": msg });
             const loadingId = appendLoading();
 
@@ -122,19 +149,22 @@
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ 
-                        query: msg,         // ✅ 修正 1: Key 改為 "query"
-                        messages: chatHistory.slice(-6),        // ✅ 修正 2: 補上歷史紀錄欄位 (目前先傳空陣列)
+                        query: msg,
+                        // 傳送最近 6 句歷史給後端 (雖然我們有 Redis，但這裡當作 Fallback)
+                        messages: chatHistory.slice(-6),
                         session_id: sessionId
                     })
                 });
+
                 if (!res.ok) {
                     const errText = await res.text();
                     throw new Error(`伺服器錯誤 (${res.status}): ${errText}`);
                 }
+
                 const data = await res.json();
                 removeElement(loadingId);
-                // 防呆處理：確保 answer 是字串 (避免之前巢狀結構的問題)
-            // 如果後端傳來的是 { answer: { answer: "...", sources: [] } } 也能相容
+
+                // 處理回傳資料結構的相容性
                 let answerText = "";
                 let sourcesList = [];
 
@@ -143,19 +173,20 @@
                     sourcesList = data.sources || [];
                 } 
                 else if (data.answer && data.answer.answer) {
-                // 相容舊版巢狀結構
                     answerText = data.answer.answer;
                     sourcesList = data.answer.sources || [];
                 }
-                appendAiMessage(data.answer, data.sources);
-                // 🔥 5. 將 AI 的回答也推入歷史紀錄 (這樣下一輪才能接續)
+
+                appendAiMessage(answerText, sourcesList);
+                
+                // 記錄 AI 回答到前端歷史
                 chatHistory.push({ "role": "assistant", "content": answerText });
             } 
             catch (err) {
                 removeElement(loadingId);
-                appendAiMessage("❌ 連線錯誤，請確認後端是否啟動。", []);
+                appendAiMessage("❌ 連線錯誤，請確認後端是否啟動或網路連線正常。", []);
                 console.error(err);
-                // 🔥 6. 如果失敗，把剛剛推入的使用者訊息移除，避免歷史錯亂
+                // 失敗時移除剛剛的使用者訊息，避免歷史錯亂
                 chatHistory.pop();
             }
         });

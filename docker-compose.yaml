@@ -38,6 +38,7 @@ services:
       - NO_PROXY=localhost,127.0.0.1,host.docker.internal
       # 小寫的通常也要設，以防萬一
       - no_proxy=localhost,127.0.0.1,host.docker.internal
+      - REDIS_URL=redis://redis:6379/
 
     volumes:
       # [前端熱更新]
@@ -50,7 +51,21 @@ services:
       # ⚠️ 請確認宿主機的這個路徑是正確的 DB 位置
       - ./data/lancedb_insure:/app/lancedb_data
       - ./data/processed_json:/app/data/processed_json
-      
+
+    depends_on:
+      - redis  
     # 讓容器可以連到 WSL2 (為了 Re-ranker)
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  redis:
+    image: "redis:7.0-alpine"
+    container_name: rag_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:

@@ -72,7 +72,8 @@ async fn chat_handler(
     let mut use_redis = false;
     let redis_key = payload.session_id.as_ref().map(|id| format!("chat:{}", id));
 
-    if let (Some(client), Some(key)) = (&state.redis_client, &redis_key) {
+    if let (Some(pool), Some(key)) = (&state.redis_pool, &redis_key) {
+        /*
         if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
             let redis_history: Result<Vec<String>, _> = conn.lrange(key, -10, -1).await;
             if let Ok(hist_json) = redis_history {
@@ -83,6 +84,40 @@ async fn chat_handler(
                         .collect();
                     use_redis = true;
                 }
+            }
+        } */
+        // pool.get().await 會從池子裡借一個連線，用完(離開 scope)會自動歸還
+        match pool.get().await {
+            Ok(mut conn) => {
+                // 讀取最後 10 筆對話
+                // 這裡要明確指定型別 Result<Vec<String>, _>
+                let redis_history: Result<Vec<String>, _> = conn.lrange(key, -10, -1).await;
+                
+                match redis_history {
+                    Ok(hist_strs) => {
+                        if !hist_strs.is_empty() {
+                            // 嘗試解析 JSON
+                            let parsed_history: Vec<Value> = hist_strs.iter()
+                                .filter_map(|s| serde_json::from_str(s).ok())
+                                .collect();
+                            
+                            if !parsed_history.is_empty() {
+                                println!("🧠 [Redis] 成功載入 {} 筆歷史紀錄", parsed_history.len());
+                                history = parsed_history;
+                                use_redis = true; // 標記 Redis 可用
+                            }
+                        } else {
+                            println!("✨ [Redis] 新的 Session，尚無歷史紀錄");
+                            use_redis = true; // Redis 連線是好的，只是沒資料，所以還是要標記為 true (以便等下寫入)
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("⚠️ [Redis] 讀取失敗 (Fallback active): {}", e);
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!("⚠️ [Redis] 無法從連線池取得連線: {}", e);
             }
         }
     }
@@ -98,8 +133,8 @@ async fn chat_handler(
 
     // --- 3. 寫回 Redis ---
     if use_redis {
-        if let (Some(client), Some(key)) = (&state.redis_client, &redis_key) {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+        if let (Some(pool), Some(key)) = (&state.redis_pool, &redis_key) {
+            if let Ok(mut conn) = pool.get().await {
                 let user_msg = json!({"role": "user", "content": payload.query});
                 let ai_msg = json!({"role": "assistant", "content": rag_result.answer});
 

@@ -15,7 +15,8 @@ use std::error::Error;
 use std::fs;
 use tokio::sync::Mutex;
 
-use redis::Client;
+// use redis::Client;
+use deadpool_redis::{Config, Runtime, Pool};
 
 // LanceDB 與 Arrow 相關引入
 use lancedb::{connect, query::{ExecutableQuery, QueryBase}};
@@ -56,7 +57,8 @@ pub struct AppState {
     pub google_api_key: String,
     pub local_llm_url: String,
     pub local_llm_model: String,
-    pub redis_client: Option<Client>,
+   // pub redis_client: Option<Client>,
+    pub redis_pool: Option<Pool>,
 }
 
 #[derive(Serialize, Debug)]
@@ -249,8 +251,10 @@ pub async fn process_query(
     // [策略 B] 主動式 AI 意圖改寫 (Pre-emptive Rewrite) 🔥 這是剛才討論的重點
     // 條件：有歷史紀錄 AND (問題很短 OR 包含代名詞)
     // 這裡我們簡單用字數判斷 (< 20 字)
-    let should_rewrite = !history.is_empty() && user_query.chars().count() < 20;
-    
+    //let should_rewrite = !history.is_empty() && user_query.chars().count() < 20;
+    // 只有當歷史紀錄「大於 1 筆」時才改寫 (代表除了當下這句，還有之前的對話)
+    // 20 -> 10 字以下改寫, 但這應該還可以調
+    let should_rewrite = history.len() > 1 && user_query.chars().count() < 50;
     if should_rewrite {
         println!("🤔 偵測到短問題且有歷史，嘗試進行「主動意圖改寫」...");
         if let Some(rewritten) = expand_query_with_ai(state, history, user_query).await {
@@ -341,6 +345,8 @@ pub async fn process_query(
     // let query_vector = query_embedding[0].clone();
     // let query_vec = model.embed(vec![final_query.clone()], None)?[0].clone();
     println!("🔍 執行向量搜尋: {}", search_target);
+
+    /*
     let query_vec = model.embed(vec![search_target.clone()], None)?[0].clone();
     // 2. 搜尋 DB
     let table = db.open_table(TABLE_NAME).execute().await?;
@@ -353,6 +359,20 @@ pub async fn process_query(
 
 
     let vector_batches: Vec<RecordBatch> = results.try_collect().await?;
+    */
+    let mut vector_batches = search_in_lancedb(&mut *model, &db, &search_target, recall_limit).await?;
+    // 🚨 Fallback 檢測邏輯
+    // 如果 (1) 搜尋結果是空的 AND (2) 我們有用過 AI 改寫 (代表 search_target != user_query)
+    if vector_batches.is_empty() && search_target != user_query {
+        println!("⚠️ [Fallback Triggered] 精準搜尋無結果 ('{}')，嘗試使用原始問題重搜...", search_target);
+    
+        // 🔄 重試：用最原始的 user_query 去搜
+        // 這樣可以避免「歷史包袱」太重導致搜不到新話題
+        vector_batches = search_in_lancedb(&mut *model, &db, user_query, recall_limit).await?;
+    
+        // 順便把 search_target 改回來，讓後面的 Rerank 知道我們換策略了
+        search_target = user_query.to_string();
+    }
 
     // --- 5. 候選結果合併 (Merge & Deduplicate) ---
     let mut raw_candidates: Vec<(String, String)> = Vec::new();
@@ -566,28 +586,26 @@ fn load_data_from_json_dir() -> (HashMap<String, ProductSummary>, HashMap<String
 pub async fn expand_query_with_ai(state: &Arc<AppState>, history: &[Value], query: &str) -> Option<String> {
     // 建立指代消解專用的 System Prompt
     let system_prompt = r#"
-    你是一個搜尋關鍵字優化機器人。你的唯一任務是將「對話歷史」與「最新問題」合併，產生一個「完整的搜尋語句」。
-    
-    【合成公式】：
-    ❌ 錯誤模式：只輸出歷史背景 (如："30歲男性") -> 禁止！
-    ❌ 錯誤模式：只輸出最新問題 (如："壽險推薦") -> 禁止！
-    ✅ 正確模式：[使用者畫像] + [最新問題的具體關鍵字]
-    
-    【執行規則】：
-    1. **提取畫像**：從歷史中找出年齡、性別、職業 (例如：58歲男性)。
-    2. **鎖定意圖**：從「最新問題」中找出他想問的商品或話題 (例如：外幣投資)。
-    3. **指代還原**：如果最新問題有「那...呢」、「它...」，請替換為上一個討論的商品；如果是新話題，則保留新話題。
-    
-    【範例】：
-    History: "我是30歲工程師"
-    Current: "那醫療險呢？"
-    Result: "適合30歲工程師的醫療險推薦"  <-- (一定要包含 '醫療險')
+    你是一個 RAG 搜尋意圖優化專家。你的任務是結合「對話歷史」與「最新問題」，產出最精準的搜尋關鍵字。
 
-    History: "58歲退休"
-    Current: "想找投資"
-    Result: "58歲退休族適合的投資型保單" <-- (一定要包含 '投資')
-    
-    請直接輸出結果，不要解釋。
+    【核心規則】：
+    1. **繼承人設 (最重要)**：永遠保留歷史中的「年齡」、「性別」、「職業」或「家庭狀況」等資訊。(例如：30歲男性、營造業)。
+    2. **意圖切換 (Negative Check)**：
+       - 如果最新問題包含「不要...」、「改看...」、「不是...」等否定詞。
+       - **必須移除** 歷史中被否定的關鍵字 (例如：使用者說「不要投資型」，你就要把「投資、變額」拿掉，改加入「純壽險、傳統型」)。
+       - **解除鎖定**：不要再加入上一輪推薦的具體產品名稱。
+    3. **產品鎖定**：只有在使用者「追問」細節 (如：那費用呢？) 時，才鎖定上一輪的產品名稱。
+
+    【合成範例】：
+    History: 30歲男性, 推薦投資型 -> AI推薦富邦投資
+    Current: "那如果不要投資，純粹壽險呢？"
+    Result: "30歲男性 終身壽險 定期壽險 (排除投資型)"  <-- (關鍵：保留年齡，但切換險種)
+
+    History: 50歲女性 -> AI推薦防癌險
+    Current: "費用多少"
+    Result: "50歲女性 防癌險 費用費率"
+
+    請直接輸出優化後的搜尋字串。
     "#;
     
     // 準備歷史訊息字串 (給 Gemini 或 Local LLM 參考用)
@@ -847,6 +865,7 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
     let local_llm_url = env::var("VLLM_ENDPOINT").unwrap_or("http://localhost:8000/v1/chat/completions".to_string());
     let local_llm_model = env::var("MODEL_NAME").unwrap_or("local-model".to_string());
 
+    /*
     let redis_client = match env::var("REDIS_URL") {
         Ok(url) => {
             match Client::open(url) {
@@ -856,6 +875,25 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
                 },
                 Err(e) => {
                     eprintln!("⚠️ Redis URL 格式錯誤，將使用純前端記憶模式: {}", e);
+                    None
+                }
+            }
+        },
+        Err(_) => {
+            println!("ℹ️ 未設定 REDIS_URL，將使用純前端記憶模式");
+            None
+        }
+    }; */
+    let redis_pool = match env::var("REDIS_URL") {
+        Ok(url) => {
+            // 使用 deadpool 的 Config 來建立連線池
+            match Config::from_url(url).create_pool(Some(Runtime::Tokio1)) {
+                Ok(pool) => {
+                    println!("✅ Redis 連線池建立成功 (Deadpool)");
+                    Some(pool)
+                },
+                Err(e) => {
+                    eprintln!("⚠️ Redis 設定失敗，將使用純前端記憶模式: {}", e);
                     None
                 }
             }
@@ -875,6 +913,32 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
         google_api_key,
         local_llm_url,
         local_llm_model,
-        redis_client,
+        redis_pool,
     }))
+}
+
+// 這是把原本散落在 process_query 裡的搜尋邏輯拉出來
+async fn search_in_lancedb(
+    model: &mut TextEmbedding,
+    db: &lancedb::Connection,
+    query_text: &str,
+    limit: usize
+) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
+    
+    // 1. 向量化
+
+    let query_vec = model.embed(vec![query_text.to_string()], None)?[0].clone();
+
+    // 2. 搜尋 DB
+    let table = db.open_table(TABLE_NAME).execute().await?;
+    let results = table
+        .query()
+        .nearest_to(query_vec)?
+        .limit(limit)
+        .execute()
+        .await?;
+
+    // 3. 收集結果
+    let batches: Vec<RecordBatch> = results.try_collect().await?;
+    Ok(batches)
 }
