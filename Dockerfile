@@ -60,21 +60,26 @@ RUN strip /app/target/release/web
 # 🔥 Runtime 也要用 Ubuntu 24.04，確保 glibc 版本一致
 FROM ubuntu:24.04
 
-ARG USER_ID=1000
-ARG GROUP_ID=1000
+#ARG USER_ID=1000
+#ARG GROUP_ID=1000
 # 建立使用者，不要用 root 跑 (Trivy 很在意這點)
-RUN groupadd -g ${GROUP_ID} appuser && \
-    useradd -m -u ${USER_ID} -g appuser appuser
+#RUN groupadd -g ${GROUP_ID} appuser || true && \
+#    useradd -m -u ${USER_ID} -g ${GROUP_ID} -o --no-log-init appuser
 
-WORKDIR /app
+#WORKDIR /app
 
 # 安裝 Runtime 依賴
 RUN echo "Acquire::https::Verify-Peer \"false\";" > /etc/apt/apt.conf.d/99ignore-ssl && \
     apt-get update && apt-get install -y \
     openssl \
     ca-certificates \
+    gosu \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1000 appuser \
+    && useradd -m -u 1000 -g appuser appuser
+
+WORKDIR /app
 
 # 複製 Binary
 COPY --from=builder /app/target/release/web /app/server
@@ -82,9 +87,11 @@ COPY --from=builder /app/target/release/web /app/server
 # 建立資料夾
 RUN mkdir -p data frontend data/processed_json lancedb_data
 
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 # 🔥 3. [關鍵一步] 更改權限 (把 /app 下所有東西送給 appuser)
 # 如果沒做這步，appuser 之後會無法寫入 /app/data 或產生 log
-RUN chown -R appuser:appuser /app
+# RUN chown -R appuser:appuser /app
 
 # 環境變數
 ENV RUST_LOG=info
@@ -93,7 +100,8 @@ ENV PORT=8081
 
 EXPOSE 8081
 
-# 切換非 root 使用者
-USER appuser
+USER root
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 CMD ["/app/server"]
