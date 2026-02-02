@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 set -e
 
 # 1. 讀取環境變數，如果沒傳就預設 1000
@@ -18,6 +18,8 @@ usermod -o -u "$target_uid" appuser
 # 因為 UID 變了，原本屬於舊 ID 的檔案現在會讀不到，所以要刷一遍權限
 # 注意：只刷需要的目錄，避免整顆硬碟刷太久
 echo "🔧 Fixing permissions..."
+mkdir -p /app/data/model_cache
+chown -R appuser:appuser /app/data/model_cache
 chown -R appuser:appuser /app/data
 chown -R appuser:appuser /app/lancedb_data
 chown -R appuser:appuser /app/frontend 

@@ -4,6 +4,7 @@ data/lancedb_store/   # 這是 DB 產生的檔案，我們希望掛載 Volume，
 data/lancedb_insure/
 data/raw_docx/
 data/raw_pdfs/
+data/model_cache/    # 模型快取檔案，不要燒進去
 .env             # 環境變數通常由 docker-compose 注入，不要燒進去
 Dockerfile
 docker-compose.yaml

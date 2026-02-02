@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from sentence_transformers import CrossEncoder
 import torch
 import os
+import time
 
 app = FastAPI(title="Local Rerank Service")
 
@@ -35,7 +36,9 @@ class RerankResponse(BaseModel):
 async def rerank(request: RerankRequest):
     if not request.documents:
         return {"scores": [], "indices": []}
-
+    print(f"⚡ [Rerank Start] 收到 Query: '{request.query}' | 需處理 {len(request.documents)} 筆文件...")
+    
+    start_time = time.time()
     # 準備模型輸入: [(query, doc1), (query, doc2), ...]
     pairs = [[request.query, doc] for doc in request.documents]
     
@@ -55,7 +58,8 @@ async def rerank(request: RerankRequest):
         )
         
         # 也可以選擇在這裡直接過濾掉負分的結果 (視需求而定)
-        
+        duration = time.time() - start_time
+        print(f"✅ [Rerank Done] 耗時: {duration:.2f} 秒")
         return {
             "scores": [scores_list[i] for i in sorted_indices],
             "indices": sorted_indices

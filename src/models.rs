@@ -129,10 +129,15 @@ pub struct SynonymEntry {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RagData {
-    pub keywords: Vec<String>,
     pub target_audience: String,
-    pub faq: Vec<FaqItem>,
+    pub keywords: Vec<String>,
+    
+    #[serde(default)] 
+    pub chunks: Vec<String>,
+    
     pub synonym_mapping: Option<Vec<SynonymEntry>>,
+    pub faq: Vec<FaqItem>,
+    
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -2,14 +2,9 @@
 
 services:
   web:
-    build: 
-      context: .
-      network: host
-      args:
-        HTTP_PROXY: ${HTTP_PROXY}
-        HTTPS_PROXY: ${HTTPS_PROXY}
-        http_proxy: ${HTTP_PROXY}
-        https_proxy: ${HTTPS_PROXY}
+#    build: 
+#      context: .
+    image: bhchou/insur_rag:v1
     container_name: rag_web
     ports:
       - "8081:8081"
@@ -39,6 +34,8 @@ services:
       - REDIS_URL=redis://redis:6379/
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
+        # 強制指定快取位置，不再依賴預設值
+      - FASTEMBED_CACHE_PATH=/app/data/model_cache
 
     volumes:
       # [前端熱更新]
@@ -51,6 +48,7 @@ services:
       # ⚠️ 請確認宿主機的這個路徑是正確的 DB 位置
       - ./data/lancedb_insure:/app/lancedb_data
       - ./data/processed_json:/app/data/processed_json
+      - ./data/model_cache:/app/data/model_cache
 
     depends_on:
       - redis  

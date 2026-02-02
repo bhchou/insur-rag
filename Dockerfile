@@ -76,6 +76,9 @@ RUN echo "Acquire::https::Verify-Peer \"false\";" > /etc/apt/apt.conf.d/99ignore
     gosu \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
+    # 👇 [關鍵修正] 先刪除佔用 1000 的 ubuntu 使用者與群組
+    && (userdel -r ubuntu || true) \
+    && (groupdel ubuntu || true) \
     && groupadd -g 1000 appuser \
     && useradd -m -u 1000 -g appuser appuser
 
@@ -85,7 +88,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/web /app/server
 
 # 建立資料夾
-RUN mkdir -p data frontend data/processed_json lancedb_data
+RUN mkdir -p data frontend data/processed_json lancedb_data data/model_cache
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
