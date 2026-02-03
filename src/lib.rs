@@ -914,8 +914,19 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
             // 使用 deadpool 的 Config 來建立連線池
             match Config::from_url(url).create_pool(Some(Runtime::Tokio1)) {
                 Ok(pool) => {
-                    println!("✅ Redis 連線池建立成功 (Deadpool)");
-                    Some(pool)
+                    match pool.get().await {
+                        Ok(_) => {
+                            println!("✅ Redis 連線池建立成功 (Deadpool) - 連線測試通過");
+                            Some(pool)
+                        },
+                        Err(e) => {
+                            eprintln!("⚠️ Redis 設定格式正確，但無法連線至 Server: {}", e);
+                            eprintln!("   (將降級使用純記憶體模式)");
+                            None // 這裡回傳 None，讓系統退回無 Redis 模式
+                        }
+                    }
+                    // println!("✅ Redis 連線池建立成功 (Deadpool)");
+                    // Some(pool)
                 },
                 Err(e) => {
                     eprintln!("⚠️ Redis 設定失敗，將使用純前端記憶模式: {}", e);
