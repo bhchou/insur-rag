@@ -1,6 +1,3 @@
-# docker-compose.wsl.yaml
-version: '3.8'
-
 services:
   web:
     # 針對 WSL2 強制開啟 Host Mode
