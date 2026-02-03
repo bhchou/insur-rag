@@ -55,6 +55,8 @@ services:
     # 讓容器可以連到 WSL2 (為了 Re-ranker)
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - rag_network
 
   redis:
     image: "redis:7.0-alpine"
@@ -64,6 +66,12 @@ services:
     volumes:
       - redis_data:/data
     restart: unless-stopped
+    networks:
+      - rag_network
 
 volumes:
   redis_data:
+
+networks:
+  rag_network:
+    driver: bridge

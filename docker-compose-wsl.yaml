@@ -1,0 +1,20 @@
+# docker-compose.wsl.yaml
+version: '3.8'
+
+services:
+  web:
+    # 針對 WSL2 強制開啟 Host Mode
+    network_mode: "host"
+    
+    # 覆蓋環境變數：因為 Host Mode 下，localhost 就是 WSL2 本機
+    environment:
+      - RERANK_API_URL=http://localhost:8009/rerank
+      - REDIS_URL=redis://localhost:6379/
+
+    # Host Mode 不需要 ports 對應，所以清空它 (這是語法技巧)
+    ports: []
+
+  redis:
+    # Redis 也一起改用 host mode，方便 web 連線
+    network_mode: "host"
+    ports: []
