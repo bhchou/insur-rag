@@ -1,64 +1,58 @@
-#version: '3.8'
-
 services:
   web:
-#    build: 
-#      context: .
-    image: bhchou/insur-rag:v1
+    image: bhchou/insur-rag:v1.0.1
     container_name: rag_web
     ports:
-      - "8081:8081"
+      - "8081:8081" # 對外開放 Port
     
-    # 1. 讀取您的 .env 檔案 (載入 LLM 設定、Key、RAG 參數)
     env_file:
       - .env
 
-    # 2. 環境變數覆寫 (針對 Docker 環境的修正)
     environment:
-      # [修正 DB 路徑] 
-      # 強制容器內部讀取這個掛載點，忽略 .env 或 Global Constant
+      # [資料庫與模型路徑]
       - LANCEDB_PATH=/app/lancedb_data
-
-      # [修正 Reranker 連線] 
-      # 您的 .env 寫的是 localhost，但在容器內要改成 host.docker.internal 才能連回 WSL2
-      - RERANK_API_URL=http://host.docker.internal:8009/rerank
-      
-      # [System Prompt 路徑]
-      # 確保與容器內的路徑一致 (WORKDIR 是 /app，所以是 relative path)
       - SYSTEM_PROMPT_PATH=./data/system_prompt.txt
+      - FASTEMBED_CACHE_PATH=/app/data/model_cache
+      
+      # [Redis 連線]
+      # 🔥 重點 1: 在 Bridge 模式下，直接用 service 名稱 "redis" 當作主機名稱
+      # Docker 內部的 DNS 會自動幫你解析出正確 IP
+      - REDIS_URL=redis://rag_redis:6379/
 
-      # 🔥 [關鍵修正 2] 讓 Rust 程式執行時也能過 Proxy
-      - NO_PROXY=localhost,127.0.0.1,host.docker.internal
-      # 小寫的通常也要設，以防萬一
-      - no_proxy=localhost,127.0.0.1,host.docker.internal
-      - REDIS_URL=redis://redis:6379/
+      # [Rerank Server 連線]
+      # 🔥 重點 2: 使用 host.docker.internal 連回宿主機 (WSL2)
+      # 即使是在 Linux 上，只要配合下面的 extra_hosts 設定，這招也通用！
+      - RERANK_API_URL=http://host.docker.internal:8009/rerank
+
+      # [Proxy 設定] 讓程式能正確繞過 Proxy 連到自己和 Host
+      - NO_PROXY=localhost,127.0.0.1,host.docker.internal,rag_redis
+      - no_proxy=localhost,127.0.0.1,host.docker.internal,rag_redis
+
+      # [權限設定]
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
-        # 強制指定快取位置，不再依賴預設值
-      - FASTEMBED_CACHE_PATH=/app/data/model_cache
 
     volumes:
-      # [前端熱更新]
       - ./frontend:/app/frontend
-
-      # [System Prompt] 大腦設定
       - ./data/system_prompt.txt:/app/data/system_prompt.txt
-
-      # [資料庫] 把宿主機的 data/lancedb_insure 掛進去
-      # ⚠️ 請確認宿主機的這個路徑是正確的 DB 位置
       - ./data/lancedb_insure:/app/lancedb_data
       - ./data/processed_json:/app/data/processed_json
       - ./data/model_cache:/app/data/model_cache
 
     depends_on:
-      - redis  
-    # 讓容器可以連到 WSL2 (為了 Re-ranker)
+      - redis
+
+    # 🔥 重點 3: 這行是關鍵！
+    # 它會告訴容器："host.docker.internal" 對應到 Docker 的網關 IP (172.x.x.1 或 10.x.x.1)
+    # 這樣容器就能透過這個名字連回你的 WSL2 Python Server
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
   redis:
     image: "redis:7.0-alpine"
     container_name: rag_redis
+    # Bridge 模式下，Redis 不一定要把 Port 6379 露給外面 (WSL2)，
+    # 只要露給同個網路內的 web 容器即可。但為了方便除錯，留著也沒差。
     ports:
       - "6379:6379"
     volumes:
