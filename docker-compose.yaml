@@ -1,6 +1,6 @@
 services:
   web:
-    image: bhchou/insur-rag:v1.0.1
+    image: bhchou/insur-rag:v2
     container_name: rag_web
     ports:
       - "8081:8081" # 對外開放 Port
