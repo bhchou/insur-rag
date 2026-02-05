@@ -295,7 +295,7 @@ pub async fn process_query(
         println!("ℹ️ 無需 AI 改寫 (無歷史或問題夠完整)，使用原始查詢");
     }
 
-    let mut forced_candidates: Vec<(String, String, f32)> = Vec::new();
+    let forced_candidates: Vec<(String, String, f32)> = Vec::new();
     let mut forced_filenames = HashSet::new();
     let mut search_filter: Option<String> = None;
 
@@ -538,7 +538,7 @@ pub async fn process_query(
 }
 
 // 回傳 (摘要Map, 同義詞Map)
-fn load_data_from_json_dir() -> (HashMap<String, ProductSummary>, HashMap<String, String>) {
+/*fn load_data_from_json_dir() -> (HashMap<String, ProductSummary>, HashMap<String, String>) {
     let mut summaries = HashMap::new();
     let mut synonyms = HashMap::new();
     
@@ -593,7 +593,7 @@ fn load_data_from_json_dir() -> (HashMap<String, ProductSummary>, HashMap<String
     println!("   - 同義詞庫: {} 筆", synonyms.len());
     
     (summaries, synonyms)
-}
+} */
 
 pub async fn expand_query_with_ai(state: &Arc<AppState>, history: &[Value], query: &str) -> Option<String> {
     // 建立指代消解專用的 System Prompt
@@ -785,41 +785,81 @@ async fn rerank_documents(
 
     println!("⚖️ 正在進行 Re-ranking ({} 筆候選, 取 Top {} 到 {})...", candidates.len(), top_k, api_url);
 
-    let resp = client.post(api_url)
+    let rerank_response_result = client.post(api_url)
         .json(&request_body)
         .send()
-        .await?;
+        .await;
 
-    let rerank_res: RerankResponse = resp.json().await?;
+    // 2. 判斷連線結果
+    let rerank_res: RerankResponse = match rerank_response_result {
+        Ok(resp) if resp.status().is_success() => {
+            // A. 連線成功且 HTTP 200 OK -> 解析 JSON
+            match resp.json::<RerankResponse>().await {
+                Ok(res) => res, // 解析成功，拿到重排序結果
+                Err(e) => {
+                    println!("⚠️ [非 Demo 時間] Rerank JSON 解析失敗: {}", e);
+                    // 解析失敗也視為 Rerank 失敗，回傳一個空的結構讓下面跑 Fallback
+                    RerankResponse { indices: vec![], scores: vec![] } 
+                }
+            }
+        },
+        Ok(resp) => {
+            // B. 連線成功但 HTTP 錯誤 (如 500, 404)
+            println!("⚠️ [非 Demo 時間] Rerank Server 回傳錯誤代碼: {}", resp.status());
+            RerankResponse { indices: vec![], scores: vec![] }
+        },
+        Err(e) => {
+            // C. 連線完全失敗 (Mac 沒開機、Tailscale 斷線)
+            println!("⚠️ [非 Demo 時間] 無法連線至 Rerank Server: {}", e);
+            RerankResponse { indices: vec![], scores: vec![] }
+        }
+    };
 
     // 3. 根據回傳的 indices 重新組裝結果
     let mut ranked_results = Vec::new();
     let mut file_counts: HashMap<String, usize> = HashMap::new();
     
-    for (i, &original_idx) in rerank_res.indices.iter().enumerate() {
-        if ranked_results.len() >= top_k { break; }
-        
-        let score = rerank_res.scores[i];
-        
-        // 💡 門檻值過濾
-        if score < -5.0 { 
-            continue; 
-        }
+    // 3. 邏輯分流：如果有 Rerank 結果就照舊，沒有就走「原始路徑」
+    if !rerank_res.indices.is_empty() {
+        // =========== [情境 A: Demo 時間 - 正常 Rerank] ===========
+        println!("✅ Rerank 成功，使用 AI 重排序結果...");
+        for (i, &original_idx) in rerank_res.indices.iter().enumerate() {
+            if ranked_results.len() >= top_k { break; }
+            
+            let score = rerank_res.scores[i];
+            
+            // 💡 門檻值過濾
+            if score < -5.0 { continue; }
 
-        // 🔥 關鍵改變：直接從傳入的 candidates 取值
-        // original_idx 是 Python 回傳的原始索引，對應到 candidates 的順序
-        let (src, txt) = &candidates[original_idx];
-        
-        // 檢查這份檔案是否已經額滿 (多樣性過濾)
-        let count = file_counts.entry(src.clone()).or_insert(0);
-        
-        if *count < max_chunks_per_doc {
-            println!("   ⭐ [Top {}] 分數: {:.2} | 來源: {}", i+1, score, src);
-            ranked_results.push((src.clone(), txt.clone(), score));
-            *count += 1;
+            // original_idx 是 Python 回傳的原始索引
+            if let Some((src, txt)) = candidates.get(original_idx) {
+                let count = file_counts.entry(src.clone()).or_insert(0);
+                if *count < max_chunks_per_doc {
+                    println!("   ⭐ [Top {}] 分數: {:.2} | 來源: {}", i+1, score, src);
+                    ranked_results.push((src.clone(), txt.clone(), score));
+                    *count += 1;
+                }
+            }
         }
-        else {
-            println!("   ⏭️ [跳過] 檔案額滿 ({}/{}): {:.2} | 來源: {}", *count, max_chunks_per_doc, score, src);
+    } 
+    else {
+        // =========== [情境 B: 非 Demo 時間 - 降級處理] ===========
+        println!("🛌 Rerank 休息中，直接回傳 LanceDB 原始排序...");
+        
+        // 直接遍歷原始 candidates (假設 LanceDB 已經有初步排序)
+        for (i, (src, txt)) in candidates.iter().enumerate() {
+            if ranked_results.len() >= top_k { break; }
+
+            // 檢查多樣性過濾 (依舊保留這層邏輯)
+            let count = file_counts.entry(src.clone()).or_insert(0);
+            
+            if *count < max_chunks_per_doc {
+                // 給一個假分數 (0.0) 或標示這不是 Rerank 結果
+                let fake_score = 0.0; 
+                println!("   📦 [原始結果 {}] 來源: {}", i+1, src);
+                ranked_results.push((src.clone(), txt.clone(), fake_score));
+                *count += 1;
+            }
         }
     }
 
