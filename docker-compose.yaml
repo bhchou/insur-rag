@@ -33,10 +33,10 @@ services:
       - PGID=${PGID:-1000}
 
     volumes:
-      - ./frontend:/app/frontend
+      #- ./frontend:/app/frontend
       - ./data/system_prompt.txt:/app/data/system_prompt.txt
       - ./data/lancedb_insure:/app/lancedb_data
-      - ./data/processed_json:/app/data/processed_json
+      #- ./data/processed_json:/app/data/processed_json
       - ./data/model_cache:/app/data/model_cache
 
     depends_on:

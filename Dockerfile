@@ -90,6 +90,9 @@ COPY --from=builder /app/target/release/web /app/server
 # 建立資料夾
 RUN mkdir -p data frontend data/processed_json lancedb_data data/model_cache
 
+COPY data/processed_json /app/data/processed_json
+COPY frontend /app/frontend
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 # 🔥 3. [關鍵一步] 更改權限 (把 /app 下所有東西送給 appuser)
