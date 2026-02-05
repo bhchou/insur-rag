@@ -7,5 +7,4 @@
 /data/*.pdf
 /data/raw_pdfs
 /data/raw_docx
-/data/processed_json
 /data/model_cache
