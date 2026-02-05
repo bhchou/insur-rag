@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-web-svc
+  labels:
+    app: insur-rag
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8081 # 對應 Rust App
+      protocol: TCP
+      name: http
+  selector:
+    app: insur-rag

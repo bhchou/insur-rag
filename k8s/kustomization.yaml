@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: apps  # 維持您習慣的 namespace，若要改 insur-rag 也可以
+
+commonLabels:
+  app: insur-rag  # 統一標籤，方便管理
+
+resources:
+- pvc.yaml         # [新增] 用來申請 OCI Block Volume
+- deployment.yaml  # 主程式
+- service.yaml     # 服務定義
+- ingress.yaml     # 外部存取設定
+- configmap.yaml  # 環境變數設定
+# - namespace.yaml # 如果 apps namespace 已經存在，這行可以註解掉
+
+images:
+- name: rag_web    # 這必須跟 deployment.yaml 裡的 image 名稱一樣
+  newName: registry.gitlab.com/choustudio/insur-rag
+  newTag: v1       # CI 流程會自動更新這個 Tag

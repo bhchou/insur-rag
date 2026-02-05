@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-web-ingress
+  annotations:
+    # 指定使用 Nginx Ingress
+    kubernetes.io/ingress.class: nginx
+    # 限制上傳大小 (如果需要上傳檔案)
+    cert-manager.io/cluster-issuer: letsencrypt
+
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # --- 安全性：限流設定 (DDoS 防護) ---
+    # 每個 IP 每秒最多 10 個請求
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    # 允許瞬間突發流量到 20 個 (Buffer)
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    # 超過限制時回傳 503 Service Unavailable
+    nginx.ingress.kubernetes.io/limit-req-status-code: "503"
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - insur-rag.blackjackzone.me
+      secretName: insur-rag-dev-tls
+  rules:
+    # 如果還沒有 Domain，可以先用 OKE LoadBalancer 的 IP
+    # 或者用 nip.io (例如: rag.123.45.67.89.nip.io)
+    - host: insur-rag.blackjackzone.me 
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-web-svc
+                port:
+                  number: 80
