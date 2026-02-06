@@ -52,6 +52,7 @@ update-manifest-job:
   stage: update-manifest
   # 使用含有 git 和 ssh 的輕量映像檔
   image: line/kubectl-kustomize:latest
+  tags:
     - rasp_arm64
   rules:
     - if: $CI_COMMIT_TAG
