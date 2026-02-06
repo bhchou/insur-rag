@@ -64,14 +64,16 @@ update-manifest-job:
     - chmod 600 ~/.ssh/id_rsa
     
     # 2. 略過 Host Key 檢查 (避免 CI 卡在 "Are you sure?")
-    - echo -e "Host gitlab.com\n\tStrictHostKeyChecking no\n\tIPQoS 0x00\n\tAddressFamily inet\n" >> ~/.ssh/config
-    
+    #- echo -e "Host gitlab.com\n\tStrictHostKeyChecking no\n\tIPQoS 0x00\n\tAddressFamily inet\n" >> ~/.ssh/config
+    - printf "Host gitlab.com\n\tStrictHostKeyChecking no\n\tIPQoS 0x00\n\tAddressFamily inet\n" >> ~/.ssh/config
+
     # 3. 設定機器人身分
     - git config --global user.email "ci-bot@gmail.com"
     - git config --global user.name "CI Bot"
 
   script:
     - echo "🔄 Cloning manifest repo..."
+    - export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o IPQoS=0x00 -o AddressFamily=inet"
     - git clone --depth 1 $MANIFEST_REPO manifest-repo
     - cd manifest-repo
     
