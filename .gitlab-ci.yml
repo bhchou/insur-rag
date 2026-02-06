@@ -21,7 +21,8 @@ build-job:
   stage: build
   # 直接用 docker cli，它會透過掛載的 socket 連到 Pi 5 的 Docker Daemon
   image: docker:24-cli
-  
+  tags:
+    - rasp_arm64
   # 只有打 Tag 時才執行
   rules:
     - if: $CI_COMMIT_TAG
@@ -51,7 +52,8 @@ update-manifest-job:
   stage: update-manifest
   # 使用含有 git 和 ssh 的輕量映像檔
   image: bitnami/git:latest
-  
+  tags:
+    - rasp_arm64
   rules:
     - if: $CI_COMMIT_TAG
 
