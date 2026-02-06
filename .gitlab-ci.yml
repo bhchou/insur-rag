@@ -1,70 +1,93 @@
-image: docker:24-git
-
-workflow:
-  rules:
-    - if: $CI_COMMIT_TAG
-    - when: never
-
 stages:
   - build
-  - deploy-dev
-
-services:
-  - name: docker:24-dind
-    alias: docker
-    command: ["--tls=false"]
+  - update-manifest
 
 variables:
-  # CI_REGISTRY_IMAGE 會自動抓取當前專案的 Registry 路徑
-  CI_IMAGE: $CI_REGISTRY_IMAGE
-  DOCKER_BUILDKIT: 1
-  DOCKER_HOST: tcp://docker:2375
-  DOCKER_DRIVER: overlay2
-  DOCKER_TLS_CERTDIR: ""
+  # 設定您的 Manifest Repo 位址 (請修改為您的實際位址)
+  # 格式必須是 SSH (git@...) 才能使用 Deploy Key
+  MANIFEST_REPO: "git@gitlab.com:choustudio/insur-rag-manifests.git"
+  
+  # Image 名稱定義
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
+  LATEST_TAG: $CI_REGISTRY_IMAGE:latest
+  
+  # Git 優化
+  GIT_DEPTH: "1"
 
-build:
+# ==========================================
+# 🏗️ Build Stage: 建置並推送 (使用 Docker Socket)
+# ==========================================
+build-job:
   stage: build
+  # 直接用 docker cli，它會透過掛載的 socket 連到 Pi 5 的 Docker Daemon
+  image: docker:24-cli
+  
+  # 只有打 Tag 時才執行
   rules:
     - if: $CI_COMMIT_TAG
-  tags:
-    - rasp_arm64
-  before_script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-  script:
-    - docker build -t $CI_IMAGE:$CI_COMMIT_TAG .
-    - docker push $CI_IMAGE:$CI_COMMIT_TAG
 
-deploy:
-  stage: deploy-dev
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+
+  script:
+    - echo "🏗️ Building Docker Image on Pi 5 (Native Speed)..."
+    
+    # 嘗試拉取 latest 當作快取來源 (加速編譯)
+    - docker pull $LATEST_TAG || true
+    
+    # 建置 Image
+    # --cache-from: 使用宿主機上現有的 Layer
+    - docker build --cache-from $LATEST_TAG -t $IMAGE_TAG -t $LATEST_TAG .
+    
+    # 推送
+    - echo "🚀 Pushing image..."
+    - docker push $IMAGE_TAG
+    - docker push $LATEST_TAG
+
+# ==========================================
+# 📝 Manifest Stage: 修改 Config Repo (GitOps)
+# ==========================================
+update-manifest-job:
+  stage: update-manifest
+  # 使用含有 git 和 ssh 的輕量映像檔
+  image: bitnami/git:latest
+  
   rules:
     - if: $CI_COMMIT_TAG
-  image: line/kubectl-kustomize
-  tags:
-    - rasp_arm64
+
   before_script:
-    - 'command -v ssh-agent >/dev/null || ( apk update && apk add openssh-client )'
-    - 'command -v git >/dev/null || ( apk update && apk add git )'
-    - eval $(ssh-agent -s)
-    # ⚠️ 記得在 GitLab CI/CD Settings 裡設定 SSH_PRIVATE_KEY
-    - echo "$SSH_PRIVATE_KEY" | ssh-add -
+    # 1. 設定 SSH Key (從變數讀取私鑰)
     - mkdir -p ~/.ssh
-    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
-    - ssh-keyscan gitlab.com >> ~/.ssh/known_hosts
+    - echo "$GITOPS_SSH_PRIV_KEY" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
     
-    # 🔥 修改 1: 專案 Git URL 改為 insur-rag
-    - git remote set-url origin git@gitlab.com:choustudio/insur_rag.git
+    # 2. 略過 Host Key 檢查 (避免 CI 卡在 "Are you sure?")
+    - echo -e "Host gitlab.com\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config
     
-    - git remote get-url origin
-    - git config --global user.email "bhchou@gmail.com"
-    - git config --global user.name "Jack Chou"
+    # 3. 設定機器人身分
+    - git config --global user.email "ci-bot@gmail.com"
+    - git config --global user.name "CI Bot"
+
   script:
-    - git checkout -B main
+    - echo "🔄 Cloning manifest repo..."
+    - git clone --depth 1 $MANIFEST_REPO manifest-repo
+    - cd manifest-repo
+    
+    # 假設您的 yaml 放在 k8s/ 資料夾下
     - cd k8s
     
-    # 🔥 修改 2: Kustomize image name 改為 rag_web
-    # 這會把 kustomization.yaml 裡的 newTag 換成當前的 CI_COMMIT_TAG
-    - kustomize edit set image rag_web=$CI_IMAGE:$CI_COMMIT_TAG
+    - echo "✏️ Updating kustomization.yaml to version $CI_COMMIT_TAG..."
     
-    - cat kustomization.yaml
-    - git commit -am "[skip ci] insur-rag image update to $CI_COMMIT_TAG"
+    # 使用 sed 直接替換 newTag 的值
+    # 假設原本格式是 newTag: xxxxx
+    - sed -i "s/newTag: .*/newTag: \"$CI_COMMIT_TAG\"/" kustomization.yaml
+    
+    # 檢查修改結果 (印出來確認)
+    - cat kustomization.yaml | grep newTag
+    
+    # 提交並推送
+    - git add kustomization.yaml
+    - git commit -m "chore(release): update rag-web image to $CI_COMMIT_TAG"
     - git push origin main
+    
+    - echo "✅ Manifest updated! ArgoCD will sync shortly."
