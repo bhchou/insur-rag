@@ -58,6 +58,9 @@ update-manifest-job:
     - if: $CI_COMMIT_TAG
 
   #before_script:
+  before_script:
+    - 'command -v ssh-agent >/dev/null || ( apk update && apk add openssh-client )'
+    - 'command -v git >/dev/null || ( apk update && apk add git )'
   script:
     # 1. 設定 SSH Key (從變數讀取私鑰)
     - mkdir -p ~/.ssh
