@@ -80,14 +80,14 @@ update-manifest-job:
     
     # 使用 sed 直接替換 newTag 的值
     # 假設原本格式是 newTag: xxxxx
-    - sed -i "s/newTag: .*/newTag: \"$CI_COMMIT_TAG\"/" kustomization.yaml
+    - 'sed -i "s/newTag: .*/newTag: \"$CI_COMMIT_TAG\"/" kustomization.yaml'
     
     # 檢查修改結果 (印出來確認)
     - cat kustomization.yaml | grep newTag
     
     # 提交並推送
     - git add kustomization.yaml
-    - git commit -m "chore(release): update rag-web image to $CI_COMMIT_TAG"
+    - 'git commit -m "chore(release): update rag-web image to $CI_COMMIT_TAG"''
     - git push origin main
     
     - echo "✅ Manifest updated! ArgoCD will sync shortly."
