@@ -51,13 +51,13 @@ build-job:
 update-manifest-job:
   stage: update-manifest
   # 使用含有 git 和 ssh 的輕量映像檔
-  image: bitnami/git:latest
-  tags:
+  image: line/kubectl-kustomize:latest
     - rasp_arm64
   rules:
     - if: $CI_COMMIT_TAG
 
-  before_script:
+  #before_script:
+  script:
     # 1. 設定 SSH Key (從變數讀取私鑰)
     - mkdir -p ~/.ssh
     - echo "$GITOPS_SSH_PRIV_KEY" > ~/.ssh/id_rsa
@@ -65,13 +65,13 @@ update-manifest-job:
     
     # 2. 略過 Host Key 檢查 (避免 CI 卡在 "Are you sure?")
     #- echo -e "Host gitlab.com\n\tStrictHostKeyChecking no\n\tIPQoS 0x00\n\tAddressFamily inet\n" >> ~/.ssh/config
-    - printf "Host gitlab.com\n\tStrictHostKeyChecking no\n\tIPQoS 0x00\n\tAddressFamily inet\n" >> ~/.ssh/config
+    #- printf "Host gitlab.com\n\tStrictHostKeyChecking no\n\tIPQoS 0x00\n\tAddressFamily inet\n" >> ~/.ssh/config
 
     # 3. 設定機器人身分
     - git config --global user.email "ci-bot@gmail.com"
     - git config --global user.name "CI Bot"
 
-  script:
+  #script:
     - echo "🔄 Cloning manifest repo..."
     - export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o IPQoS=0x00 -o AddressFamily=inet"
     - git clone --depth 1 $MANIFEST_REPO manifest-repo
