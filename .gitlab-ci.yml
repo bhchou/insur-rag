@@ -87,7 +87,7 @@ update-manifest-job:
     
     # 提交並推送
     - git add kustomization.yaml
-    - 'git commit -m "chore(release): update rag-web image to $CI_COMMIT_TAG"''
+    - 'git commit -m "chore(release): update rag-web image to $CI_COMMIT_TAG"'
     - git push origin main
     
     - echo "✅ Manifest updated! ArgoCD will sync shortly."
