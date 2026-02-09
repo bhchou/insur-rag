@@ -1,65 +1,76 @@
-# 🛡️ AI Insurance Consultant RAG (Rust + Python + LanceDB)
+# 🛡️ AI Insurance Consultant RAG (Web Edition)
 
 > **Project: An Old Soldier's Digital Legacy**
 >
-> 這是一個基於 **Rust** (高效能服務) 與 **Python** (智慧資料處理) 的混合式 RAG (Retrieval-Augmented Generation) 系統。旨在解決保險商品條款複雜、術語艱澀的檢索難題，提供具備「核保邏輯」與「顧問思維」的 AI 諮詢服務。
+> 這是一個基於 **Rust (Axum)** 與 **Python** 的混合式 RAG (Retrieval-Augmented Generation) 系統。旨在解決保險商品條款複雜、術語艱澀的檢索難題，提供具備「核保邏輯」與「顧問思維」的 AI 諮詢服務。
+>
+> **目前狀態：v2.0 Stable (Web UI + Kubernetes Deployment)**
 
 ## 🌟 專案亮點 (Key Features)
 
-本專案不同於一般的 RAG Demo，它針對金融保險領域的 **「高正確性」** 與 **「合規性」** 需求進行了深度優化：
+本專案針對金融保險領域的 **「高正確性」** 與 **「合規性」** 需求進行了深度優化：
 
 * **⚡ 混合式架構 (Hybrid Architecture)**
-    * **Python ETL (Offline)**：利用 Google Gemini 強大的理解力，將非結構化文件 (PDF/DOCX) 轉化為結構化 JSON，自動提取「適用客群」、「同義詞 (Client Slangs)」與「商品摘要」。
-    * **Rust Serving (Online)**：利用 Rust 的記憶體安全性與高效能，處理向量檢索、Re-ranking 與 API 服務。
+    * **Python ETL (Offline)**：利用 Google Gemini 強大的理解力，將非結構化文件 (PDF/DOCX) 轉化為結構化 JSON。
+    * **Rust Serving (Online)**：利用 Axum 框架提供高效能 Web 服務，整合向量檢索、Re-ranking 與 Redis 對話記憶。
 
 * **🎯 漏斗式精準檢索 (The Precision Funnel)**
-    * **Recall (廣度)**：先撈取 Top 50 筆候選資料，確保不遺漏冷門商品。
+    * **Recall (廣度)**：LanceDB 撈取 Top 50 筆候選資料。
     * **Re-ranking (準度)**：使用 Cross-Encoder (BGE-Reranker) 進行語意重排序，精選 Top 10。
-    * **Reasoning (邏輯)**：透過 LLM 的閱讀理解能力，剔除不相關的雜訊 (例如商業火險)，並進行核保邏輯過濾。
+    * **Reasoning (邏輯)**：透過 LLM (Google Gemini) 剔除雜訊並進行核保邏輯過濾。
 
-* **🧠 語意增強與同義詞注入**
-    * 解決「死掉賠錢」搜不到「身故保險金」的問題。在 ETL 階段自動建立同義詞庫 (Synonym Mapping)，並在檢索時動態擴充 Query。
+* **🧠 多輪對話與記憶 (Context Awareness)**
+    * 整合 **Redis** 儲存 Session Context，讓 AI 能記得使用者的上一句話（如：「那保費多少？」）。
+    * 前端與後端分離設計，支援 Session 恢復。
 
-* **🛡️ 合規與顧問思維**
-    * 系統 Prompt 內建「雙十原則」財務規劃邏輯。
-    * 具備基礎「核保過濾」能力（如年齡檢核）。
-    * 嚴格的 **Zero Hallucination** 政策：資料不足時誠實告知，不捏造保單內容。
+* **🛡️ 企業級資安與部署**
+    * **WAF Bypass 策略**：前端 Payload 優化，通過嚴格的 ModSecurity 規則。
+    * **Zero Trust Network**：整合 **Tailscale Sidecar**，支援透過內網 VPN 直連，繞過公網暴露風險。
+    * **GitOps**：支援 ArgoCD 自動化部署至 Kubernetes (OKE)。
 
 ## 🏗️ 系統架構 (Architecture)
 
 ```mermaid
 graph TD
-    subgraph "Phase 1: Python ETL (Offline)"
-        A["原始保單 .docx/.pdf"] -->|Python Parser| B("Gemini 2.5 Flash")
-        B -->|Extract| C{"生成 Metadata"}
-        C -->|JSON| F("processed_json/*.json")
+    subgraph "Phase 1: ETL (Offline)"
+        A["保單 PDF/DOCX"] -->|Python| B("Gemini Parser")
+        B --> F("Processed JSON + Embeddings")
     end
 
-    subgraph "Phase 2: Rust RAG (Runtime)"
-        User["使用者提問"] -->|Query| G("Rust Main")
-        G <---|載入| F
-        G -->|即時產生| H[["同義詞 Query Expansion"]]
-        G -->|即時產生| L[["商品摘要 Product Summary"]]
-        H -->|Vector Search| I["LanceDB (Recall Top 50)"]
-        L -->|Vector Search| I["LanceDB (Recall Top 50)"]
-        I -->|Re-rank| J["BGE-Reranker (Select Top 10)"]
-        J -->|Context| K["LLM (Reasoning & Generation)"]
-        K -->|Response| User
+    subgraph "Phase 2: Runtime (K8s/Docker)"
+        User((User Browser)) -->|HTTP/JSON| LB["Nginx Ingress / Tailscale"]
+        LB --> Web["Rust Axum Server"]
+        
+        Web <---|載入| F
+        Web <-->|R/W History| Redis[("Redis Cache")]
+        
+        Web -->|1. Vector Search| Lance["LanceDB (Embedded)"]
+        Web -->|2. Re-rank| Rerank["BGE-Reranker API"]
+        Web -->|3. Generate| Gemini["Google Gemini API"]
+        
+        Gemini -->|Response| Web
+        Web -->|HTML/JSON| User
     end
 ```
 
 ## 🛠️ 技術棧 (Tech Stack)
-* **Core Logic:** Rust (Tokio, Serde, reqwest)
+* **Backend**: Rust (Axum, Tokio, Serde, reqwest)
 
-* **ETL Scripting:** Python 3.10+ (Pydantic, Google GenAI SDK, python-docx)
+* **Frontend**: Vanilla JS + TailwindCSS (No build step required)
 
-* **Vector Database:** LanceDB (Embedded, Serverless)
+* **ETL Scripting**: Python 3.10+ (Pydantic, Google GenAI SDK, python-docx)
 
-* **Embeddings:** BGE-Base-zh-v1.5 (via fastembed-rs)
+* **Database**: LanceDB (Vector), Redis (Session Store, History Cache)
 
-* **Re-ranker:** BGE-Reranker-v2-m3 (Python API / Local)
+* **AI Models**: 
+    * Embedding: BGE-Base-zh-v1.5 (via fastembed-rs)
 
-* **LLM Service:** Google Gemini (ETL), Local LLM / OpenAI Compatible API (Serving)
+    * Re-ranker: BGE-Reranker-v2-m3 (Python API / Local)
+
+    * LLM: Google Gemini 2.5+ Flash, Local LLM / OpenAI Compatible API
+
+* **Infra**: Docker, Kubernetes (OKE), ArgoCD, Tailscale
+
 
 ## 📂 目錄結構
 
@@ -77,9 +88,17 @@ graph TD
 │   ├── etl_pdf_to_json.py  # 核心 ETL 程式 
 │   └── rerank_server.py    # Re-ranker API Server
 ├── src/
-│   ├── main.rs             # Rust 主程式 (RAG Pipeline)
+│   ├── bin/
+│   │   ├── cli.rs          # CLI Entrypoint
+│   │   └── web.rs          # Web service (AXUM)
+│   ├── lib.rs              # Rust 主程序 (RAG Pipeline)
 │   └── models.rs           # 資料結構定義
-└── .env                    # 環境變數 (API Keys)
+├── .env                    # 環境變數 (API Keys)
+├── .gitlab-ci.yml          # Gitlab CI Pipeline
+├── .docker-compose.yml     # docker compose file for local docker
+├── entrypoint.sh           # user/permission fix on docker
+└── Dockerfile              # docker build file
+
 ```
 ## 🚀 快速開始 (Quick Start)
 ### 1. 環境準備
@@ -98,10 +117,21 @@ pip install -r requirements.txt
 python pysrc/etl_docx_to_json.py
 ```
 ### 3. 啟動 RAG 服務
-Rust 程式會自動掃描 JSON 檔，建立索引與向量資料庫，並進入 CLI 問答模式。
-```Bash
-cargo run --release
-```
+Rust 程式會自動掃描 JSON 檔，建立索引與向量資料庫
+* 進入 CLI 問答模式。
+    ```Bash
+    cargo run --bin cli
+    ```
+* 進入 Web Service
+    ```Bash
+    cargo run --bin web
+    ```
+* 本地端 Docker (含Redis)
+    ```Bash
+    docker-compose up --build
+    ```
+* K8S 部署 - 請自行參考 `.gitlab-ci.yml`
+
 ## 🧠 核心邏輯解析 (Under the Hood)
 ### 1. 語意切片與標籤注入 (Semantic Chunking with Metadata)
 我們不只切分文字，還將 ETL 階段分析出的「客群標籤」埋入每個 Chunk 的 Header。
@@ -122,12 +152,16 @@ cargo run --release
 
 * **誠實原則：** 拒絕回答資料庫中不存在的資訊。
 
-## 📝 Future Roadmap (V2)
-* **[ ] 結構化核保篩選：** 在 JSON 中加入 min_age, max_age 等數值欄位，在向量檢索前進行 Pre-filtering。
+## 📝 Roadmap & Changelog
+* **[X] 結構化核保篩選：** 在 JSON 中加入 min_age, max_age 等數值欄位，在向量檢索前進行 Pre-filtering。(V1)
 
-* **[ ] 多輪對話 (Multi-turn)：** 加入對話歷史記憶，支援追問。
+* **[X] Web UI 介面** (V2 - Axum + Tailwind)
 
-* **[ ] Web UI：** 使用 Axum + React 構建前端介面。
+* **[X] 多輪對話 (Multi-turn/Redis)：** 加入對話歷史記憶，支援追問。(V2)
+
+* **[X] Kubernetes 部署** (V2 - Helm/Manifests)。
+
+* **[ ] 語音輸入/輸出** (Future)
 ---
 **Author:** Jack Chou (Retiring 2028) License: MIT
 

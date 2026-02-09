@@ -8,3 +8,4 @@
 /data/raw_pdfs
 /data/raw_docx
 /data/model_cache
+*.orig
