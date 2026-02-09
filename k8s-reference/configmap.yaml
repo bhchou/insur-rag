@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-config
+  labels:
+    app: insur-rag
+data:
+  # 注意：如果 Redis 有密碼，這個應該放 Secret
+  REDIS_URL: "redis://my-redis-master.redis-system.svc.cluster.local:6379/"
+  # 這看起來是 Tailscale IP，未來很容易變，放這裡改比較方便
+  RERANK_API_URL: "http://127.0.0.1:8009/rerank"
+  # --- [A] 路徑設定 (配合 Deployment 的掛載點) ---
+  # 1. System Prompt (來自 ConfigMap 掛載)
+  SYSTEM_PROMPT_PATH: "/app/config/system_prompt.txt"
+  
+  # 2. JSON 資料源 (來自 Docker Image 內建，唯讀)
+  # 請確認您的 Dockerfile 是 COPY 到這個路徑
+  SOURCE_JSON_PATH: "/app/data/processed_json"
+  
+  # 3. LanceDB 資料庫 (寫入 PVC)
+  LANCEDB_PATH: "/app/storage/lancedb_data"
+  
+  # 4. 模型快取 (寫入 PVC)
+  FASTEMBED_CACHE_PATH: "/app/storage/model_cache"
+  
+  LLM_PROVIDER: "google"
+  
+  RAG_RECALL_LIMIT: "50"
+
+  RAG_RERANK_LIMIT: "10"
+
+  MAX_CHUNKS_PER_DOC: "1"
+
+  # --- [B] 提示詞內容 ---
+  system_prompt.txt: |
+    你是一位資深的保險核保與理財顧問。你的任務是根據「參考資料」與使用者的「家庭狀況/客戶畫像」，嚴格篩選並推薦保單。
+
+    

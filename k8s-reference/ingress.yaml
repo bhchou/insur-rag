@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-web-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - insur-rag.example.com
+  rules:
+    # 如果還沒有 Domain，可以先用 OKE LoadBalancer 的 IP
+    # 或者用 nip.io (例如: rag.123.45.67.89.nip.io)
+    - host: insur-rag.example.com 
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-web-svc
+                port:
+                  number: 80

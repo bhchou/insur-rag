@@ -256,12 +256,6 @@ pub async fn process_query(
         }
     }
 
-    // [策略 B] 主動式 AI 意圖改寫 (Pre-emptive Rewrite) 🔥 這是剛才討論的重點
-    // 條件：有歷史紀錄 AND (問題很短 OR 包含代名詞)
-    // 這裡我們簡單用字數判斷 (< 20 字)
-    //let should_rewrite = !history.is_empty() && user_query.chars().count() < 20;
-    // 只有當歷史紀錄「大於 1 筆」時才改寫 (代表除了當下這句，還有之前的對話)
-    // 20 -> 10 字以下改寫, 但這應該還可以調
     let should_rewrite = history.len() > 1 && user_query.chars().count() < 50;
     if should_rewrite {
         println!("🤔 偵測到短問題且有歷史，嘗試進行「主動意圖改寫」...");
@@ -269,20 +263,8 @@ pub async fn process_query(
             println!("✅ AI 改寫成功: '{}'", rewritten);
             let mut final_rewritten = rewritten.clone();
             
-            // 🔥【防呆實作】檢查邏輯
-            // 1. 原始問題長度檢查：大於 2 個中文字 (6 bytes)，避免把 "那呢"、"是的" 這種無意義短語補進去。
-            // 2. 遺失檢查：如果 AI 改寫後的字串裡，竟然找不到原始使用者的輸入。
             if user_query.len() > 6 && !final_rewritten.contains(user_query) {
                 println!("⚠️ [防呆觸發] AI 改寫遺失使用者關鍵意圖，強制補回！");
-                
-                // 動作：直接把原始問題 append 在後面
-                // 範例狀況：
-                //   History: "58歲"
-                //   Query: "那外幣投資呢"
-                //   AI Fail: "58歲男性" (漏了外幣)
-                //   Fix Result: "58歲男性 那外幣投資呢" 
-                // (雖然句子不通順，但對向量搜尋來說，關鍵字齊全才是最重要的)
-                
                 final_rewritten.push_str(" ");
                 final_rewritten.push_str(user_query);
             }
@@ -299,8 +281,6 @@ pub async fn process_query(
     let mut forced_filenames = HashSet::new();
     let mut search_filter: Option<String> = None;
 
-    // 1. 提取括弧內的文字 (支援 『』 「」 或 "")
-    // 這邊假設使用者會用這些常見括弧
     let re = Regex::new(r#"[『「《【“"‘'（\(](.*?)[」』》】”"’'）\)]"#).unwrap();
     
     for cap in re.captures_iter(user_query) {
@@ -327,77 +307,31 @@ pub async fn process_query(
 
         search_filter = Some(filter_cond.clone());
     }
-    /*
-        let table = state.db.open_table(TABLE_NAME).execute().await?;
-        let specific_results = table
-            .query()
-            .only_if(filter_cond)
-            .limit(10) // 每個檔案抓前幾段摘要即可
-            .execute()
-            .await?;
 
-        let batches: Vec<RecordBatch> = specific_results.try_collect().await?;
-        
-        // 將結果轉為 candidates 格式
-        for batch in batches {
-            let src_col = batch.column_by_name("source_file").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let txt_col = batch.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            
-            for i in 0..batch.num_rows() {
-                let src = src_col.value(i).to_string();
-                let txt = txt_col.value(i).to_string();
-                // 🔥 給予無限大的分數 (f32::INFINITY)，確保它在 Re-rank 前絕對是第一名
-                forced_candidates.push((src, txt, f32::INFINITY));
-            }
-        }
-    } */
-
-    // 1. 向量化問題
-    // let query_embedding = model.embed(vec![user_query.to_string()], None)?;
-    // let query_vector = query_embedding[0].clone();
-    // let query_vec = model.embed(vec![final_query.clone()], None)?[0].clone();
     println!("🔍 執行向量搜尋: {}", search_target);
 
-    /*
-    let query_vec = model.embed(vec![search_target.clone()], None)?[0].clone();
-    // 2. 搜尋 DB
-    let table = db.open_table(TABLE_NAME).execute().await?;
-    let results = table
-        .query()
-        .nearest_to(query_vec)?
-        .limit(recall_limit) // 取前 3 個最相關的片段
-        .execute()
-        .await?;
-
-
-    let vector_batches: Vec<RecordBatch> = results.try_collect().await?;
-    */
     let mut vector_batches = search_in_lancedb(&mut *model, &db, &search_target, recall_limit, search_filter.clone()).await?;
-    // 🚨 Fallback 檢測邏輯
-    // 如果 (1) 搜尋結果是空的 AND (2) 我們有用過 AI 改寫 (代表 search_target != user_query)
+
     if vector_batches.is_empty() && search_target != user_query {
         println!("⚠️ [Fallback Triggered] 精準搜尋無結果 ('{}')，嘗試使用原始問題重搜...", search_target);
-    
-        // 🔄 重試：用最原始的 user_query 去搜
-        // 這樣可以避免「歷史包袱」太重導致搜不到新話題
+
         vector_batches = search_in_lancedb(&mut *model, &db, user_query, recall_limit, search_filter).await?;
-    
-        // 順便把 search_target 改回來，讓後面的 Rerank 知道我們換策略了
+
         search_target = user_query.to_string();
     }
 
-    // --- 5. 候選結果合併 (Merge & Deduplicate) ---
+
     let mut raw_candidates: Vec<(String, String)> = Vec::new();
     let mut seen_texts = HashSet::new();
 
-    // (1) 優先放入強制命中的
+
     for (src, txt, _) in forced_candidates {
         if seen_texts.insert(txt.clone()) {
             raw_candidates.push((src, txt));
         }
     }
 
-    // (2) 再放入向量搜尋的
+
     for b in vector_batches {
         let src_col = b.column_by_name("source_file").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
         let txt_col = b.column_by_name("text").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
@@ -413,11 +347,6 @@ pub async fn process_query(
         }
     }
 
-    
-    // --- 6. 檢查結果 (Fallback 邏輯可選) ---
-    // 由於我們前面已經做了 Pre-emptive Rewrite，這裡的 Fallback 重要性降低
-    // 但如果你想保留「搜不到東西時再試一次」的邏輯，可以寫在這裡
-    // 不過根據新策略，通常不需要二次 Embedding 了
 
     if raw_candidates.is_empty() {
         return Ok(RagResponse {
@@ -434,7 +363,7 @@ pub async fn process_query(
         ("打工", vec!["打工", "遊學", "度假", "海外"]),
         ("投資", vec!["投資", "基金", "變額", "收益"]),
     ];
-    // 2. 定義「受保護」的寬鬆險種 (當嚴格模式啟動時，這些關鍵字也要被允許)
+
     let protected_rules = vec![
         ("壽險", vec!["壽險", "身故", "人壽", "儲蓄", "還本"]),
         ("意外", vec!["意外", "傷害", "骨折", "產險"]),
@@ -443,7 +372,7 @@ pub async fn process_query(
     let mut allowed_keywords: Vec<&str> = Vec::new();
     let mut strict_mode_triggered = false;
 
-    // 3. 掃描嚴格規則 (支援多重命中)
+
     for (category, keywords) in &strict_rules {
         if user_query.contains(category) {
             println!("🎯 偵測到嚴格類別意圖: [{}]", category);
@@ -461,7 +390,6 @@ pub async fn process_query(
         }
     }
 
-    // 5. 執行過濾 (只有在嚴格模式觸發時才做)
     if !allowed_keywords.is_empty() {
         let before_count = raw_candidates.len();
         
@@ -476,18 +404,13 @@ pub async fn process_query(
         println!("🧹 混合過濾執行: {} -> {} 筆 (關鍵字聯集: {:?})", 
             before_count, raw_candidates.len(), allowed_keywords);
 
-        // 防呆：如果濾完變 0 筆 (例如 User 同時問了兩個資料庫都沒有的險種)
+
         if raw_candidates.is_empty() {
              println!("⚠️ 過濾後無結果，取消過濾條件。");
-             // 這裡建議回復備份，或者就讓它回傳無結果
+
         }
     }
 
-
-
-    // --- 7. Re-ranking (關鍵優化) ---
-    // 注意：Rerank 時建議用「改寫後的 search_target」還是「原始 user_query」？
-    // 建議：用 search_target (因為它消除了代名詞)，Reranker 比較看得懂
     let top_results_all = rerank_documents(&search_target, raw_candidates, summaries, recall_limit, &rerank_api).await?;
     let top_results: Vec<(String, String, f32)> = top_results_all.into_iter().take(rerank_limit).collect();
 
@@ -522,78 +445,18 @@ pub async fn process_query(
     final_context.push_str("=== 詳細檢索片段 ===\n");
     final_context.push_str(&snippets_text);
 
-    // 7. 最後生成
-    //ask_llm(&final_context, user_query).await?;
+
     let llm_answer = ask_llm(state, &final_context, &search_target).await?;
     
-    // 整理來源列表
+
     let mut sorted_sources: Vec<String> = hit_files.into_iter().collect();
     sorted_sources.sort();
 
-    // ✅ 回傳結構化資料
     Ok(RagResponse {
         answer: llm_answer,
         sources: sorted_sources,
     })
 }
-
-// 回傳 (摘要Map, 同義詞Map)
-/*fn load_data_from_json_dir() -> (HashMap<String, ProductSummary>, HashMap<String, String>) {
-    let mut summaries = HashMap::new();
-    let mut synonyms = HashMap::new();
-    
-    println!("🚀 Rust 正在掃描 JSON 資料夾建立快取...");
-    
-    let walker = WalkDir::new(PROCESSED_JSON_DIR).into_iter();
-    
-    for entry in walker.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "json") {
-            if let Ok(content) = fs::read_to_string(path) {
-                // 嘗試解析 JSON
-                if let Ok(data) = serde_json::from_str::<models::PolicyData>(&content) {
-                    
-                    // --- 1. 處理摘要 (原有邏輯) ---
-                    let intro = format!(
-                        "【商品總覽】\n名稱: {}\n類型: {}\n特色: {:?}\n適合對象: {}\n",
-                        data.basic_info.product_name,
-                        data.basic_info.product_type,
-                        data.investment.features,
-                        data.rag_data.target_audience
-                    );
-
-                    summaries.insert(data.source_filename.clone(), ProductSummary {
-                        name: data.basic_info.product_name,
-                        intro,
-                    });
-
-                    // --- 2. 處理同義詞 (新增邏輯) ---
-                    // 假設 models::RagData 裡面有 synonym_mapping 欄位
-                    // 注意：您需要在 models.rs 裡對應加上這個欄位，如果沒有的話
-                    if let Some(mapping) = &data.rag_data.synonym_mapping {
-                        for entry in mapping {
-                            // 處理逗號分隔 (例如: "死掉, 走了")
-                            let slangs: Vec<&str> = entry.slang.split(&['、', ','][..]).collect();
-                            for s in slangs {
-                                let clean_s = s.trim().to_string();
-                                if !clean_s.is_empty() {
-                                    // 建立反向索引: 口語 -> 專業術語
-                                    synonyms.insert(clean_s, entry.formal.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    println!("📚 資料載入完成！");
-    println!("   - 商品摘要: {} 筆", summaries.len());
-    println!("   - 同義詞庫: {} 筆", synonyms.len());
-    
-    (summaries, synonyms)
-} */
 
 pub async fn expand_query_with_ai(state: &Arc<AppState>, history: &[Value], query: &str) -> Option<String> {
     // 建立指代消解專用的 System Prompt
@@ -620,8 +483,6 @@ pub async fn expand_query_with_ai(state: &Arc<AppState>, history: &[Value], quer
     請直接輸出優化後的搜尋字串。
     "#;
     
-    // 準備歷史訊息字串 (給 Gemini 或 Local LLM 參考用)
-    // 我們取最後 4 句就好，避免 Token 爆炸
     let history_text = history.iter()
         .rev() // 從新到舊
         .take(4)
@@ -654,9 +515,9 @@ pub async fn expand_query_with_ai(state: &Arc<AppState>, history: &[Value], quer
     }
 }
 
-// 路徑 1: 本地 LLM (使用 .no_proxy())
+
 async fn expand_local(state: &Arc<AppState>, system_prompt: &str, user_content: &str) -> Result<String, Box<dyn Error>> {
-    // 🔥 關鍵：這裡必須用 no_proxy，否則連不到 host.docker.internal
+
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()?;
@@ -674,10 +535,10 @@ async fn expand_local(state: &Arc<AppState>, system_prompt: &str, user_content: 
         "model": state.local_llm_model,
         "messages": [
             { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user_content } // 這裡把歷史+問題包在一起給它
+            { "role": "user", "content": user_content } 
         ],
-        "temperature": 0.1, // 改寫不需要創意，越低越好
-        "max_tokens": 1024   // 改寫通常很短
+        "temperature": 0.1, 
+        "max_tokens": 1024   
     });
 
     let mut request_builder = client.post(&api_url)
@@ -700,16 +561,16 @@ async fn expand_local(state: &Arc<AppState>, system_prompt: &str, user_content: 
     Err(format!("Local LLM 回應錯誤: {}", resp_status).into())
 }
 
-// 路徑 2: Google Gemini (使用標準 Proxy)
+
 async fn expand_google(state: &Arc<AppState>, system_prompt: &str, user_content: &str) -> Result<String, Box<dyn Error>> {
     if state.google_api_key.is_empty() {
         return Err("缺少 GOOGLE_API_KEY".into());
     }
 
-    // 🔥 關鍵：這裡使用預設 Client，會自動讀取 HTTPS_PROXY 環境變數
+   
     let client = reqwest::Client::new();
 
-    // Gemini 的 Prompt 組合方式
+    
     let full_prompt = format!("{}\n\n{}", system_prompt, user_content);
 
     let url = format!(
@@ -740,7 +601,6 @@ async fn expand_google(state: &Arc<AppState>, system_prompt: &str, user_content:
 }
 
 
-// ✅ 修改函式簽名：輸入改為 candidates: Vec<(String, String)>
 async fn rerank_documents(
     query: &str,
     candidates: Vec<(String, String)>, // (source_file, text)
@@ -758,13 +618,11 @@ async fn rerank_documents(
         return Ok(Vec::new());
     }
 
-    // 1. 準備給 Re-ranker API 的資料
-    // 我們需要保留原始的 (src, txt) 對應關係，同時準備一份「注入摘要」的版本給 AI 讀
+
     let mut doc_texts_for_api: Vec<String> = Vec::new();
 
     for (src, txt) in &candidates {
-        // 為了讓 Re-ranker 判斷準確，我們把「摘要」也加進去給它讀
-        // 這樣它才知道 "優利精選" 是投資型保單
+
         let content_for_judge = if let Some(sum) = summaries.get(src) {
             format!("{}\n文件內容: {}", sum.intro, txt)
         } else {
@@ -773,8 +631,7 @@ async fn rerank_documents(
         doc_texts_for_api.push(content_for_judge);
     }
 
-    // 2. 呼叫 Python Re-ranker API
-    // let client = reqwest::Client::new();
+
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()?;
@@ -793,45 +650,44 @@ async fn rerank_documents(
     // 2. 判斷連線結果
     let rerank_res: RerankResponse = match rerank_response_result {
         Ok(resp) if resp.status().is_success() => {
-            // A. 連線成功且 HTTP 200 OK -> 解析 JSON
+
             match resp.json::<RerankResponse>().await {
-                Ok(res) => res, // 解析成功，拿到重排序結果
+                Ok(res) => res, 
                 Err(e) => {
                     println!("⚠️ [非 Demo 時間] Rerank JSON 解析失敗: {}", e);
-                    // 解析失敗也視為 Rerank 失敗，回傳一個空的結構讓下面跑 Fallback
+                    
                     RerankResponse { indices: vec![], scores: vec![] } 
                 }
             }
         },
         Ok(resp) => {
-            // B. 連線成功但 HTTP 錯誤 (如 500, 404)
+            
             println!("⚠️ [非 Demo 時間] Rerank Server 回傳錯誤代碼: {}", resp.status());
             RerankResponse { indices: vec![], scores: vec![] }
         },
         Err(e) => {
-            // C. 連線完全失敗 (Mac 沒開機、Tailscale 斷線)
+            
             println!("⚠️ [非 Demo 時間] 無法連線至 Rerank Server: {}", e);
             RerankResponse { indices: vec![], scores: vec![] }
         }
     };
 
-    // 3. 根據回傳的 indices 重新組裝結果
+
     let mut ranked_results = Vec::new();
     let mut file_counts: HashMap<String, usize> = HashMap::new();
     
-    // 3. 邏輯分流：如果有 Rerank 結果就照舊，沒有就走「原始路徑」
+
     if !rerank_res.indices.is_empty() {
-        // =========== [情境 A: Demo 時間 - 正常 Rerank] ===========
+
         println!("✅ Rerank 成功，使用 AI 重排序結果...");
         for (i, &original_idx) in rerank_res.indices.iter().enumerate() {
             if ranked_results.len() >= top_k { break; }
             
             let score = rerank_res.scores[i];
             
-            // 💡 門檻值過濾
+
             if score < -5.0 { continue; }
 
-            // original_idx 是 Python 回傳的原始索引
             if let Some((src, txt)) = candidates.get(original_idx) {
                 let count = file_counts.entry(src.clone()).or_insert(0);
                 if *count < max_chunks_per_doc {
@@ -843,18 +699,18 @@ async fn rerank_documents(
         }
     } 
     else {
-        // =========== [情境 B: 非 Demo 時間 - 降級處理] ===========
+        
         println!("🛌 Rerank 休息中，直接回傳 LanceDB 原始排序...");
         
-        // 直接遍歷原始 candidates (假設 LanceDB 已經有初步排序)
+        
         for (i, (src, txt)) in candidates.iter().enumerate() {
             if ranked_results.len() >= top_k { break; }
 
-            // 檢查多樣性過濾 (依舊保留這層邏輯)
+            
             let count = file_counts.entry(src.clone()).or_insert(0);
             
             if *count < max_chunks_per_doc {
-                // 給一個假分數 (0.0) 或標示這不是 Rerank 結果
+                
                 let fake_score = 0.0; 
                 println!("   📦 [原始結果 {}] 來源: {}", i+1, src);
                 ranked_results.push((src.clone(), txt.clone(), fake_score));
@@ -867,43 +723,12 @@ async fn rerank_documents(
 }
 
 
-// 4. 新增初始化函式 (從原本 main 提取)
 pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
     dotenv().ok();
     
     let db_path = std::env::var("LANCEDB_PATH").unwrap_or(DB_URI.to_string());
     println!("📂 連接 LanceDB 路徑: {}", db_path);
     let db = connect(&db_path).execute().await?;
-    // 初始化 DB
-    //let db = connect(DB_URI).execute().await?;
-    //println!("💾 連線至資料庫: {}", DB_URI);
-
-    //建立 Table (如果不存在)
-    // 注意: 這裡定義 Schema
-    //let embedding_dim = 1024;
-    /* let schema = Arc::new(Schema::new(vec![
-        Field::new("source_file", DataType::Utf8, false),
-        Field::new("file_hash", DataType::Utf8, false), // ★ 新增這一欄
-        Field::new("text", DataType::Utf8, false),
-        Field::new("vector", DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            embedding_dim
-        ), false),
-    ]));
-
-    let table_names = db.table_names().execute().await?;
-    let _table = if table_names.contains(&TABLE_NAME.to_string()) {
-        println!("📂 資料表 '{}' 已存在，開啟中...", TABLE_NAME);
-        db.open_table(TABLE_NAME).execute().await?
-    } 
-    else {
-        println!("✨ 資料表 '{}' 不存在，建立中...", TABLE_NAME);
-        // 建立一個空的迭代器來初始化表結構
-        let batches: Vec<Result<RecordBatch, arrow_schema::ArrowError>> = vec![]; 
-        db.create_table(TABLE_NAME, RecordBatchIterator::new(batches, schema.clone()))
-            .execute()
-            .await?
-    }; */
     
     println!("🧠 載入 Embedding 模型...");
     let cache_dir = env::var("FASTEMBED_CACHE_PATH")
@@ -918,40 +743,16 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
             .with_cache_dir(PathBuf::from(cache_dir)) 
             .with_show_download_progress(true)
     )?;
-    // let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGEBaseENV15))?;
     
-    // 載入資料 (這裡假設您已經合併了讀取函式，或保留原本分開的)
-    //let summaries = load_product_summaries(); 
-    //let synonyms = load_synonyms();
-    // let (summaries, synonyms) = load_data_from_json_dir();
     let (summaries, synonyms) = sync_database_and_load_cache(&db, &mut model).await?;
     let llm_provider = env::var("LLM_PROVIDER").unwrap_or("google".to_string());
     let google_api_key = env::var("GOOGLE_API_KEY").unwrap_or_default();
     let local_llm_url = env::var("VLLM_ENDPOINT").unwrap_or("http://localhost:8000/v1/chat/completions".to_string());
     let local_llm_model = env::var("MODEL_NAME").unwrap_or("local-model".to_string());
 
-    /*
-    let redis_client = match env::var("REDIS_URL") {
-        Ok(url) => {
-            match Client::open(url) {
-                Ok(client) => {
-                    println!("✅ Redis 連線設定成功");
-                    Some(client)
-                },
-                Err(e) => {
-                    eprintln!("⚠️ Redis URL 格式錯誤，將使用純前端記憶模式: {}", e);
-                    None
-                }
-            }
-        },
-        Err(_) => {
-            println!("ℹ️ 未設定 REDIS_URL，將使用純前端記憶模式");
-            None
-        }
-    }; */
     let redis_pool = match env::var("REDIS_URL") {
         Ok(url) => {
-            // 使用 deadpool 的 Config 來建立連線池
+
             match Config::from_url(url).create_pool(Some(Runtime::Tokio1)) {
                 Ok(pool) => {
                     match pool.get().await {
@@ -962,11 +763,10 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
                         Err(e) => {
                             eprintln!("⚠️ Redis 設定格式正確，但無法連線至 Server: {}", e);
                             eprintln!("   (將降級使用純記憶體模式)");
-                            None // 這裡回傳 None，讓系統退回無 Redis 模式
+                            None 
                         }
                     }
-                    // println!("✅ Redis 連線池建立成功 (Deadpool)");
-                    // Some(pool)
+ 
                 },
                 Err(e) => {
                     eprintln!("⚠️ Redis 設定失敗，將使用純前端記憶模式: {}", e);
@@ -993,7 +793,7 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
     }))
 }
 
-// 這是把原本散落在 process_query 裡的搜尋邏輯拉出來
+
 async fn search_in_lancedb(
     model: &mut TextEmbedding,
     db: &lancedb::Connection,
@@ -1002,20 +802,16 @@ async fn search_in_lancedb(
     filter: Option<String> 
 ) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
     
-    // 1. 向量化
 
     let query_vec = model.embed(vec![query_text.to_string()], None)?[0].clone();
 
-    // 2. 搜尋 DB
     let table = db.open_table(TABLE_NAME).execute().await?;
 
-    // ✨ 修改這裡：動態加入過濾條件
     let mut query_builder = table
         .query()
         .nearest_to(query_vec)?
         .limit(limit);
 
-    // 如果有 Filter，就加進去 (這是 LanceDB 的 SQL 語法)
     if let Some(f) = filter {
         println!("🔍 [Vector Search] 套用過濾條件: {}", f);
         query_builder = query_builder.only_if(f);
@@ -1023,16 +819,7 @@ async fn search_in_lancedb(
 
     let results = query_builder.execute().await?;
 
-/*
-    let results = table
-        .query()
-        .nearest_to(query_vec)?
-        .limit(limit)
-        .execute()
-        .await?;
-*/
 
-    // 3. 收集結果
     let batches: Vec<RecordBatch> = results.try_collect().await?;
     Ok(batches)
 }
@@ -1044,24 +831,24 @@ pub async fn sync_database_and_load_cache(
     
     println!("🔄 開始執行資料同步與快取載入...");
 
-    // 1. 準備回傳的記憶體快取物件
+
     let mut summaries = HashMap::new();
     let mut synonyms = HashMap::new();
 
-    // 2. 檢查資料表是否存在
+
     let table_names = db.table_names().execute().await?;
     let table_exists = table_names.contains(&TABLE_NAME.to_string());
 
     let table = if !table_exists {
         println!("✨ 資料表不存在，建立新表...");
-        // 定義 Schema (BGE-M3 = 1024維)
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("source_file", DataType::Utf8, false),
-            Field::new("file_hash", DataType::Utf8, false), // 儲存 Hash 用於比對
+            Field::new("file_hash", DataType::Utf8, false), 
             Field::new("text", DataType::Utf8, false),
             Field::new("vector", DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
-                512 // BGE-M3
+                512 
             ), false),
         ]));
         db.create_table(TABLE_NAME, RecordBatchIterator::new(vec![], schema)).execute().await?
@@ -1069,13 +856,11 @@ pub async fn sync_database_and_load_cache(
         db.open_table(TABLE_NAME).execute().await?
     };
 
-    // 3. 建立「現有檔案 Hash 對照表」 (避免每處理一個檔就 Query 一次 DB，太慢)
-    // 我們只撈 source_file 和 file_hash 欄位出來比對
+    
     let mut existing_hashes: HashMap<String, String> = HashMap::new();
     
     if table_exists {
-        // 注意：若資料量極大(百萬筆)，這裡需改成分頁讀取。目前幾百個檔一次讀完沒問題。
-        // match table.query().select(&["source_file", "file_hash"]).limit(10000).execute().await {
+        
         match table.query()
             .select(Select::Columns(vec!["source_file".to_string(), "file_hash".to_string()]))
             .limit(10000)
@@ -1100,9 +885,8 @@ pub async fn sync_database_and_load_cache(
     
     println!("📊 目前 DB 已索引 {} 份文件", existing_hashes.len());
 
-    // 4. 開始掃描 JSON 資料夾
     let walker = WalkDir::new(PROCESSED_JSON_DIR).into_iter();
-    let mut new_chunks_buffer: Vec<(String, String, String)> = Vec::new(); // (source, hash, text)
+    let mut new_chunks_buffer: Vec<(String, String, String)> = Vec::new(); 
     let mut updated_count = 0;
     let mut skipped_count = 0;
     let mut parse_error_count = 0;
@@ -1119,14 +903,10 @@ pub async fn sync_database_and_load_cache(
                 }
             };
 
-            // 🔥 改用 match 處理 serde 解析，不要用 if let，這樣才能看到錯在哪
+            
             match serde_json::from_str::<models::PolicyData>(&content) {
                 Ok(data) => {
-                    // ==========================================
-                    // 1. 強制載入快取 (這是 RAM 資料，每次都要做)
-                    // ==========================================
                     
-                    // A. 載入摘要
                     let intro = format!(
                         "【商品總覽】\n名稱: {}\n類型: {}\n特色: {:?}\n適合對象: {}\n",
                         data.basic_info.product_name,
@@ -1135,11 +915,11 @@ pub async fn sync_database_and_load_cache(
                         data.rag_data.target_audience
                     );
                     summaries.insert(data.source_filename.clone(), ProductSummary {
-                        name: data.basic_info.product_name.clone(), // 這裡 clone 一下比較保險
+                        name: data.basic_info.product_name.clone(), 
                         intro: intro.clone(),
                     });
 
-                    // B. 載入同義詞 (Debug: 印出有沒有讀到)
+
                     if let Some(mapping) = &data.rag_data.synonym_mapping {
                         let count_before = synonyms.len();
                         for entry in mapping {
@@ -1151,21 +931,19 @@ pub async fn sync_database_and_load_cache(
                                 }
                             }
                         }
-                        // Uncomment 下面這行可以看每個檔案載入了幾個同義詞
+                        
                         println!("   📚 {} 載入 {} 個同義詞", data.source_filename, synonyms.len() - count_before);
                     } 
                     else {
-                        // ⚠️ 這裡很重要：如果 JSON 裡真的沒有 synonym_mapping，會印出來
+                        
                         println!("   ⚠️ {} 沒有同義詞設定 (synonym_mapping is null)", data.source_filename);
                     }
 
-                    // ==========================================
-                    // 2. 處理 DB 增量更新 (這是 Disk 資料，有變才做)
-                    // ==========================================
+                    
                     let current_hash = calculate_hash(&content);
                     let filename = data.source_filename.clone();
                     
-                    // 這裡要把 existing_hashes 傳進來，或是在函式前段已經定義好
+                
                     let needs_update = match existing_hashes.get(&filename) {
                         Some(old_hash) => *old_hash != current_hash,
                         None => true, 
@@ -1182,19 +960,18 @@ pub async fn sync_database_and_load_cache(
                         let mut final_chunks = Vec::new();
 
                         if !data.rag_data.chunks.is_empty() {
-                            // A. 如果 JSON 裡本來就有切好的，直接用
+                            
                             final_chunks = data.rag_data.chunks;
                         } 
                         else {
-                            // B. JSON 沒切，我們自己組裝 (Manual Chunking Strategy)
+                            
                             println!("   ⚙️ 自動組裝內容...");
                             
-                            // Chunk 1: 商品基本介紹 + 投保規則 + 保障內容
-                            // 把這些欄位串起來變成一段文字
+                            
                             let chunk_intro = format!(
                                 "文件標題: {}\n{}\n【投保規則】\n年齡: {}\n保費限制: {}\n費用: {}\n【保障內容】\n身故: {}\n滿期: {}\n其他: {:?}\n【投資特色】\n{:?}\n風險: {:?}",
                                 data.source_filename,
-                                intro, // 剛剛組好的簡介
+                                intro, 
                                 data.conditions.age_range,
                                 data.conditions.premium_limit,
                                 data.conditions.fees_and_discounts,
@@ -1206,15 +983,14 @@ pub async fn sync_database_and_load_cache(
                             );
                             final_chunks.push(chunk_intro);
 
-                            // Chunk 2: FAQ (非常重要，是 RAG 的黃金資料)
-                            // 策略：每 3 個 QA 組成一段，避免單一段太長或太短
+                            
                             let faqs = &data.rag_data.faq;
                             if !faqs.is_empty() {
                                 let mut faq_buffer = String::from("【常見問答 FAQ】\n");
                                 for (i, qa) in faqs.iter().enumerate() {
                                     faq_buffer.push_str(&format!("Q: {}\nA: {}\n\n", qa.q, qa.a));
                                     
-                                    // 每 3 題切成一個 Chunk，或者最後一題時切
+                                    
                                     if (i + 1) % 3 == 0 || i == faqs.len() - 1 {
                                         final_chunks.push(faq_buffer.clone());
                                         faq_buffer = String::from("【常見問答 FAQ (續)】\n");
@@ -1224,8 +1000,7 @@ pub async fn sync_database_and_load_cache(
                         }
 
                         for chunk_text in final_chunks {
-                            // 這裡可以加一個長度檢查，如果單段真的太長 (>2000字)，可能還要再切
-                            // 但以目前 JSON 內容來看，手動組裝的長度應該在安全範圍內
+                            
                             new_chunks_buffer.push((filename.clone(), current_hash.clone(), chunk_text));
                         }
                         updated_count += 1;
@@ -1235,8 +1010,7 @@ pub async fn sync_database_and_load_cache(
                     }
                 },
                 Err(e) => {
-                    // 🚨 這裡會抓出為什麼沒有 Load 到資料！
-                    // 通常是 models.rs 定義跟 JSON 對不上 (例如缺少欄位、型別錯誤)
+                    
                     eprintln!("❌ JSON 解析失敗 {:?}: {}", path.file_name().unwrap(), e);
                     parse_error_count += 1;
                 }
@@ -1252,9 +1026,7 @@ pub async fn sync_database_and_load_cache(
     if parse_error_count > 0 {
         println!("   - ❌ 解析失敗 (請檢查 models.rs): {} 份", parse_error_count);
     }
-    // println!("🔎 掃描完成: {} 份維持不變, {} 份需更新/新增", skipped_count, updated_count);
-
-    // 5. 批次執行 Embedding 與寫入 (針對有變更的部分)
+    
     if !new_chunks_buffer.is_empty() {
         println!("🚀 正在對 {} 個新段落進行 Embedding...", new_chunks_buffer.len());
         
@@ -1264,10 +1036,10 @@ pub async fn sync_database_and_load_cache(
             let sources: Vec<String> = chunk.iter().map(|(s, _, _)| s.clone()).collect();
             let hashes: Vec<String> = chunk.iter().map(|(_, h, _)| h.clone()).collect();
             
-            // Embedding
+           
             let embeddings = model.embed(texts.clone(), None)?;
             
-            // 轉換為 Arrow 格式 (與之前相同)
+            
             let flat_vectors: Vec<f32> = embeddings.iter().flat_map(|v| v.clone()).collect();
             let dim = 512; // BGE-M3
             let schema = table.schema().await?;

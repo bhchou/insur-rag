@@ -1,10 +1,16 @@
-# 🛡️ AI Insurance Consultant RAG (Web Edition)
+# 🛡️ AI Insurance Consultant RAG
+![Project Status](https://img.shields.io/badge/Status-v2.0%20Stable-success)
+![Build](https://img.shields.io/badge/Build-Rust%20%7C%20Python-orange)
+![Deploy](https://img.shields.io/badge/Deploy-Kubernetes%20%7C%20Docker-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 > **Project: An Old Soldier's Digital Legacy**
 >
 > 這是一個基於 **Rust (Axum)** 與 **Python** 的混合式 RAG (Retrieval-Augmented Generation) 系統。旨在解決保險商品條款複雜、術語艱澀的檢索難題，提供具備「核保邏輯」與「顧問思維」的 AI 諮詢服務。
 >
 > **目前狀態：v2.0 Stable (Web UI + Kubernetes Deployment)**
+> 
+>**仍支援 CLI模式**
 
 ## 🌟 專案亮點 (Key Features)
 
@@ -93,6 +99,12 @@ graph TD
 │   │   └── web.rs          # Web service (AXUM)
 │   ├── lib.rs              # Rust 主程序 (RAG Pipeline)
 │   └── models.rs           # 資料結構定義
+├── frontend/               # [Web] 靜態網頁檔案
+│   └── index.html
+├── k8s-reference/          # [Ref] K8s 部署範本 (僅供參考，正式部署走 GitOps)
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── ingress.yaml
 ├── .env                    # 環境變數 (API Keys)
 ├── .gitlab-ci.yml          # Gitlab CI Pipeline
 ├── .docker-compose.yml     # docker compose file for local docker
@@ -102,7 +114,7 @@ graph TD
 ```
 ## 🚀 快速開始 (Quick Start)
 ### 1. 環境準備
-請確保已安裝 Rust 工具鏈與 Python 3。
+請確保已安裝 Rust 工具鏈、Python 3 與 Docker。
 
 ```Bash
 # 設定環境變數
@@ -125,12 +137,16 @@ Rust 程式會自動掃描 JSON 檔，建立索引與向量資料庫
 * 進入 Web Service
     ```Bash
     cargo run --bin web
+    # Server running at http://localhost:8080
     ```
 * 本地端 Docker (含Redis)
     ```Bash
     docker-compose up --build
     ```
-* K8S 部署 - 請自行參考 `.gitlab-ci.yml`
+* K8S 部署
+
+    * 本專案採用 GitOps 架構，正式 Manifests 託管於外部 CD Repo。
+    * 若需手動部署或重建環境，可參考 k8s-reference/ 目錄下的 YAML 範本。
 
 ## 🧠 核心邏輯解析 (Under the Hood)
 ### 1. 語意切片與標籤注入 (Semantic Chunking with Metadata)

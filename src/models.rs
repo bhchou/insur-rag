@@ -26,15 +26,14 @@ pub struct InsuranceMetadata {
     pub target_audience: Option<String>,
 }
 
-// 這是為了包含全文內容的 Wrapper (假設 Python 最終會吐出 JSON + 全文)
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ParsedDocument {
     pub metadata: InsuranceMetadata,
     pub full_text: String, 
 }
 
-// --- 工具 1: 強制轉為 String (給 product_name 用) ---
-// 無論 JSON 是 "A" 還是 ["A", "B"]，最後都會變成 String "A, B"
+
 fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -55,8 +54,7 @@ where
     }
 }
 
-// --- 工具 2: 轉為 Option<String> (給 code/audience 用) ---
-// 保留原本的邏輯，處理可能為 None 的欄位
+
 fn deserialize_optional_string_or_seq<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,

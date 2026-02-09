@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-web
+  labels:
+    app: insur-rag
+spec:
+  replicas: 1
+  # 🔥 重要：RWO 硬碟不支援多 Pod 同時寫入，更新時必須先殺舊的
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: insur-rag
+  template:
+    metadata:
+      labels:
+        app: insur-rag
+    spec:
+      containers:
+        # --- [1] 主程式 (Rust RAG) ---
+        - name: rag-web
+          image: rag_web # Kustomize 會自動替換成完整 Image URL
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8081 # Rust App 的 Port
+          
+          # 注入 ConfigMap 裡的變數 (PATH 都在這裡)
+          envFrom:
+            - configMapRef:
+                name: rag-config
+            - secretRef:
+                name: rag-secrets
+          
+          securityContext: {}
+
+          volumeMounts:
+            
+            # B. 設定層 (放 Prompt) -> 掛載到 /app/config
+            - name: config-volume
+              mountPath: "/app/config"
+              readOnly: true
+          
+          # 資源限制
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "100m"
+            limits:
+              memory: "8Gi"
+              cpu: "2"
+ 
+      volumes:
+        # 定義 ConfigMap
+        - name: config-volume
+          configMap:
+            name: rag-config
+            items:
+              - key: "system_prompt.txt"
+                path: "system_prompt.txt"
