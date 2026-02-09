@@ -1,5 +1,3 @@
-// src/bin/web.rs
-
 use insur_rag::{init_system, process_query, AppState};
 use axum::{
     extract::State,
@@ -73,19 +71,6 @@ async fn chat_handler(
     let redis_key = payload.session_id.as_ref().map(|id| format!("chat:{}", id));
 
     if let (Some(pool), Some(key)) = (&state.redis_pool, &redis_key) {
-        /*
-        if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-            let redis_history: Result<Vec<String>, _> = conn.lrange(key, -10, -1).await;
-            if let Ok(hist_json) = redis_history {
-                if !hist_json.is_empty() {
-                    println!("🧠 [Redis] 成功載入 {} 筆歷史紀錄", hist_json.len());
-                    history = hist_json.iter()
-                        .filter_map(|s| serde_json::from_str(s).ok())
-                        .collect();
-                    use_redis = true;
-                }
-            }
-        } */
         // pool.get().await 會從池子裡借一個連線，用完(離開 scope)會自動歸還
         match pool.get().await {
             Ok(mut conn) => {

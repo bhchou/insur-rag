@@ -151,7 +151,8 @@
                     body: JSON.stringify({ 
                         query: msg,
                         // 傳送最近 6 句歷史給後端 (雖然我們有 Redis，但這裡當作 Fallback)
-                        messages: chatHistory.slice(-6),
+                        // messages: chatHistory.slice(-6),
+                        // messages: [],
                         session_id: sessionId
                     })
                 });
