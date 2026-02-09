@@ -1,5 +1,6 @@
 pub mod models;
 
+use axum::http::status;
 use futures::TryStreamExt;
 use dotenvy::dotenv; 
 use serde_json::{Value, json};
@@ -57,6 +58,7 @@ pub struct AppState {
     pub summaries: HashMap<String, ProductSummary>,
     pub llm_provider: String,
     pub google_api_key: String,
+    pub google_models: Vec<String>,
     pub local_llm_url: String,
     pub local_llm_model: String,
    // pub redis_client: Option<Client>,
@@ -193,29 +195,51 @@ async fn ask_google_gemini(state: &Arc<AppState>, context: &str, query: &str) ->
         "contents": [{ "parts": [{ "text": full_prompt }] }]
     });
 
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
-                    state.google_api_key);
+    let mut last_error = String::new();
 
-    match client.post(&url).json(&request_body).send().await {
-        Ok(resp) => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-                    return Ok(text.to_string());
-                } 
-                else {
-                    return Err("❌ LLM 回傳格式錯誤或無內容".into());
+    for model in &state.google_models {
+
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model,
+            state.google_api_key
+        );
+        let resp = client.post(&url).json(&request_body).send().await;
+
+        match resp {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    let json: Value = response.json().await?;
+                    if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                        println!("✅ 模型 {} 呼叫成功", model);
+                        return Ok(text.to_string());
+                    } 
+                    else {
+                        // 雖然 200 OK 但格式不對 (極少見)
+                         last_error = format!("模型 {} 回傳格式錯誤", model);
+                    }
                 }
-            } else {
-                return Err("❌ 無法解析 LLM 回應".into());
+                else {
+                    // ❌ 失敗 (例如 429 Rate Limit, 500 Server Error)
+                    let err_msg = response.text().await.unwrap_or_default();
+                    println!("⚠️ 模型 {} 失敗 (Status: {}): {}", model, status, err_msg);
+                    last_error = format!("Status {}: {}", status, err_msg);
+                    // 這裡不 return，直接進入下一次迴圈 (Try Next Model)
+                }
+            }
+
+            Err(e) => {
+                // ❌ 網路連線層級的錯誤
+                println!("⚠️ 模型 {} 連線錯誤: {}", model, e);
+                last_error = e.to_string();
             }
         }
-        Err(e) => return Err(format!("❌ API 呼叫失敗: {}", e).into())
     }
+    Err(format!("❌ 所有 Google 模型皆無法使用。最後錯誤: {}", last_error).into())
 }
 
-/* for JSON and then */
 
-// --- 3. 問答邏輯 ---
 pub async fn process_query(
     state: &Arc<AppState>,
     history: &[Value],
@@ -235,7 +259,6 @@ pub async fn process_query(
     // 在 process_query 一開始
     let mut normalized_query = user_query.to_string();
 
-    // 1. 強制將數字與中文之間插入空白
     // 把 "30歲" 變成 "30 歲"，把 "100萬" 變成 "100 萬"
     let re_num_zh = Regex::new(r"(\d+)([\u4e00-\u9fa5])").unwrap();
     normalized_query = re_num_zh.replace_all(&normalized_query, "$1 $2").to_string();
@@ -246,8 +269,6 @@ pub async fn process_query(
     println!("🔧 正規化查詢: '{}' -> '{}'", user_query, normalized_query);
     let mut search_target = normalized_query.clone();
 
-    // 0. 字典擴充
-    // let mut final_query = user_query.to_string();
     for (slang, term) in synonyms {
         if user_query.contains(slang) {
             println!("💡 [字典命中] '{}' -> 加上 '{}'", slang, term);
@@ -296,7 +317,7 @@ pub async fn process_query(
             }
         }
     }
-    // 3. 如果有鎖定的檔案，直接去 DB 撈出來 (不透過向量搜尋)
+    // 如果有鎖定的檔案，直接去 DB 撈出來 (不透過向量搜尋)
     if !forced_filenames.is_empty() {
         // 組裝 SQL Filter: source_file = 'A' OR source_file = 'B'
         let filter_cond = forced_filenames
@@ -354,7 +375,7 @@ pub async fn process_query(
             sources: vec![],
         });
     }
-    // 🔥 [非對稱過濾策略]
+    
     // 定義需要「嚴格過濾」的險種。壽險、意外險因為太廣泛，故意不列入，保持寬鬆。
     let strict_rules = vec![
         ("醫療", vec!["醫療", "手術", "住院", "實支實付", "健康保險"]),
@@ -421,7 +442,7 @@ pub async fn process_query(
         });
     }
 
-    // 5. 組裝 Context (包含商品摘要)
+    // 組裝 Context (包含商品摘要)
     let mut hit_files = HashSet::new();
     let mut snippets_text = String::new();
 
@@ -433,7 +454,7 @@ pub async fn process_query(
         snippets_text.push_str(&format!("📄 [精選片段] (關聯度:{:.1}) 來源: {}\n內容: {}\n\n", score, src, txt));
     }
 
-    // 6. 注入摘要 (Summary Injection)
+    // 注入摘要 (Summary Injection)
     let mut final_context = String::new();
     final_context.push_str("=== 相關商品基本介紹 ===\n");
     for filename in &hit_files {
@@ -459,7 +480,7 @@ pub async fn process_query(
 }
 
 pub async fn expand_query_with_ai(state: &Arc<AppState>, history: &[Value], query: &str) -> Option<String> {
-    // 建立指代消解專用的 System Prompt
+
     let system_prompt = r#"
     你是一個 RAG 搜尋意圖優化專家。你的任務是結合「對話歷史」與「最新問題」，產出最精準的搜尋關鍵字。
 
@@ -572,32 +593,54 @@ async fn expand_google(state: &Arc<AppState>, system_prompt: &str, user_content:
 
     
     let full_prompt = format!("{}\n\n{}", system_prompt, user_content);
+    let mut last_error = String::new();
+    for model in &state.google_models {
+        // 動態組裝 URL
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model,
+            state.google_api_key
+        );
 
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
-        state.google_api_key
-    );
+        let body = json!({
+            "contents": [{ "parts": [{ "text": full_prompt }] }],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 1024
+            }
+        });
+        tracing::info!("🤖 嘗試使用模型: {}", model);
+        println!("🤖 嘗試使用模型: {}", model); // Debug 用，可改用 tracing::info!
 
-    let body = json!({
-        "contents": [{ "parts": [{ "text": full_prompt }] }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 1024
-        }
-    });
+        let resp = client.post(&url).json(&body).send().await;
 
-    let resp = client.post(&url).json(&body).send().await?;
-
-    let resp_status = resp.status();
-
-    if resp.status().is_success() {
-        let json: Value = resp.json().await?;
-        if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-            return Ok(text.to_string());
+        match resp {
+            Ok(r) => {
+                let status = r.status();
+                if status.is_success() {
+                    let json: Value = r.json().await?;
+                    if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                        println!("✅ 模型 {} 呼叫成功", model);
+                        return Ok(text.to_string());
+                    } 
+                    else {
+                        last_error = format!("模型 {} 回應格式錯誤，無法找到回答內容", model);
+                        //println!("⚠️ {}", last_error);
+                    }
+                }
+                else {
+                    let err_msg = r.text().await.unwrap_or_default();
+                    println!("⚠️ 模型 {} 失敗 (Status: {}): {}", model, status, err_msg);
+                    last_error = format!("Status {}: {}", status, err_msg);
+                }
+            }
+            Err(e) => {
+                println!("模型 {} 呼叫失敗: {}", model, e);
+                last_error = e.to_string();
+            }
         }
     }
-
-    Err(format!("Google API 回應錯誤: {}", resp_status).into())
+    Err(format!("所有模型皆失敗。最後錯誤: {}", last_error).into())
 }
 
 
@@ -647,7 +690,7 @@ async fn rerank_documents(
         .send()
         .await;
 
-    // 2. 判斷連線結果
+    // 判斷連線結果
     let rerank_res: RerankResponse = match rerank_response_result {
         Ok(resp) if resp.status().is_success() => {
 
@@ -736,10 +779,9 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
     
     println!("📂 使用模型快取路徑: {}", cache_dir);
 
-    // 2. 設定選項
+
     let mut model = TextEmbedding::try_new(
         InitOptions::new(EmbeddingModel::BGESmallZHV15)
-            // 🔥 [關鍵] 顯式指定 Cache 路徑
             .with_cache_dir(PathBuf::from(cache_dir)) 
             .with_show_download_progress(true)
     )?;
@@ -747,6 +789,12 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
     let (summaries, synonyms) = sync_database_and_load_cache(&db, &mut model).await?;
     let llm_provider = env::var("LLM_PROVIDER").unwrap_or("google".to_string());
     let google_api_key = env::var("GOOGLE_API_KEY").unwrap_or_default();
+    let google_models_str = std::env::var("GOOGLE_MODELS")
+        .unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+    let google_models: Vec<String> = google_models_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
     let local_llm_url = env::var("VLLM_ENDPOINT").unwrap_or("http://localhost:8000/v1/chat/completions".to_string());
     let local_llm_model = env::var("MODEL_NAME").unwrap_or("local-model".to_string());
 
@@ -787,6 +835,7 @@ pub async fn init_system() -> Result<Arc<AppState>, Box<dyn Error>> {
         summaries,
         llm_provider,
         google_api_key,
+        google_models,
         local_llm_url,
         local_llm_model,
         redis_pool,
