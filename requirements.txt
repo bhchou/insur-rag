@@ -4,4 +4,6 @@ google-genai
 python-docx
 pydantic
 python-dotenv
-
+fastapi
+sentence-transformers
+uvicorn==0.40.0
