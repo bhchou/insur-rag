@@ -1,3 +1,7 @@
+workflow:
+  rules:
+    - if: '$ENABLE_PIPELINE == "true"'
+    
 stages:
   - build
   - update-manifest
