@@ -19,8 +19,8 @@ device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is
 print(f"🚀 運算裝置: {device}")
 
 # 載入 CrossEncoder
-model = CrossEncoder(MODEL_NAME, device=device)
-# 3. [針對 Mac MPS 的優化]
+model = CrossEncoder(MODEL_NAME, device=device, max_length=1024)
+# [針對 Mac MPS 的優化]
 # 如果是 MPS，將內部模型轉換為半精度 (FP16)
 # 這會讓模型佔用的 RAM 從 ~2.2GB 降到 ~1.1GB
 if device == "mps":
@@ -55,14 +55,7 @@ async def rerank(request: RerankRequest):
         with torch.no_grad():
             scores = model.predict(
                 pairs, 
-                # [關鍵優化 A] 限制最大長度
-                # BGE-M3 原本支援 8192，不限制的話記憶體會爆炸
-                # RAG Rerank 通常 512 或 1024 就非常夠用了
-                max_length=1024, 
-                
-                # [關鍵優化 B] 限制 Batch Size
-                # 預設是 32，改小一點可以降低瞬間記憶體峰值
-                # Mac Mini 16G 建議設 12 ~ 16
+                # [關鍵優化] 限制 Batch Size，避免一次處理過多文本導致記憶體爆炸
                 batch_size=12,
                 
                 show_progress_bar=False
@@ -87,7 +80,7 @@ async def rerank(request: RerankRequest):
         #    "indices": sorted_indices
         #}
     
-        # 5. [記憶體清理]
+        # [記憶體清理]
         # 在 MPS 上，顯式呼叫垃圾回收有助於釋放 PyTorch 佔用的 Cache
         if device == "mps":
             torch.mps.empty_cache()
@@ -102,5 +95,4 @@ async def rerank(request: RerankRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # 跑在 8000 Port (或其他您喜歡的 Port)
     uvicorn.run(app, host="0.0.0.0", port=8009)
