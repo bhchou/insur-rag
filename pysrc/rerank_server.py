@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sentence_transformers import CrossEncoder
 import torch
-import os
+import gc
 import time
 
 app = FastAPI(title="Local Rerank Service")
@@ -26,6 +26,10 @@ model = CrossEncoder(MODEL_NAME, device=device, max_length=1024)
 if device == "mps":
     print("⚡ [MPS Optimization] 啟用半精度 (FP16) 模式以節省記憶體...")
     model.model.half()
+    # 強制清理載入時產生的 FP32 殘留物
+    gc.collect()
+    torch.mps.empty_cache()
+
 print("✅ 模型載入完成！")
 
 # 定義請求資料結構
@@ -56,8 +60,7 @@ async def rerank(request: RerankRequest):
             scores = model.predict(
                 pairs, 
                 # [關鍵優化] 限制 Batch Size，避免一次處理過多文本導致記憶體爆炸
-                batch_size=12,
-                
+                batch_size=8,
                 show_progress_bar=False
             )
         
